@@ -6,6 +6,7 @@ import {
   completeBuffered,
   sendBufferedAsSse,
   streamPassthrough,
+  streamSmart,
 } from './proxy.js';
 
 assertConfig();
@@ -84,6 +85,32 @@ function summarizeDetails(value) {
   return clone;
 }
 
+function logMeta(requestId, body, clientWantsStream, meta, started) {
+  console.log(JSON.stringify({
+    level: 'info',
+    request_id: requestId,
+    route: 'chat',
+    stream: clientWantsStream,
+    model: config.forceModel || body.model,
+    provider: config.providers.join(',') || 'auto',
+    output_mode: config.outputMode,
+    elapsed_ms: meta?.elapsed_ms ?? (Date.now() - started),
+    generation_ms: meta?.generation_ms,
+    rewrite_ms: meta?.rewrite_ms,
+    decision_ms: meta?.decision_ms,
+    attempts: meta?.attempts,
+    rewritten: meta?.rewritten,
+    language_detected: meta?.language_detected,
+    stream_strategy: meta?.stream_strategy,
+    translator_model: meta?.translator_model,
+    visible_chars: meta?.visible_chars,
+    source_chars: meta?.source_chars,
+    reasoning_chars: meta?.reasoning_chars,
+    messages: body.messages.length,
+    ...(config.logPromptContent ? { prompt_preview: JSON.stringify(body.messages).slice(0, 1000) } : {}),
+  }));
+}
+
 async function handleChat(req, res) {
   const requestId = crypto.randomUUID();
   res.setHeader('X-Proxy-Request-Id', requestId);
@@ -119,12 +146,23 @@ async function handleChat(req, res) {
     if (clientWantsStream && config.outputMode === 'prompt') {
       const meta = await streamPassthrough(body, res, controller.signal);
       console.log(JSON.stringify({
-        level: 'info', request_id: requestId, route: 'chat', stream: true,
+        level: 'info',
+        request_id: requestId,
+        route: 'chat',
+        stream: true,
         model: config.forceModel || body.model,
         provider: config.providers.join(',') || 'auto',
+        output_mode: config.outputMode,
         elapsed_ms: Date.now() - started,
+        stream_strategy: 'raw_passthrough',
         upstream_bytes: meta?.bytes || 0,
       }));
+      return;
+    }
+
+    if (clientWantsStream && config.outputMode === 'smart') {
+      const meta = await streamSmart(body, res, controller.signal);
+      logMeta(requestId, body, true, meta, started);
       return;
     }
 
@@ -132,26 +170,17 @@ async function handleChat(req, res) {
     if (clientWantsStream) sendBufferedAsSse(res, json);
     else sendJson(res, 200, json);
 
-    console.log(JSON.stringify({
-      level: 'info', request_id: requestId, route: 'chat', stream: clientWantsStream,
-      model: config.forceModel || body.model,
-      provider: config.providers.join(',') || 'auto',
-      output_mode: config.outputMode,
-      elapsed_ms: meta.elapsed_ms,
-      attempts: meta.attempts,
-      rewritten: meta.rewritten,
-      visible_chars: meta.visible_chars,
-      reasoning_chars: meta.reasoning_chars,
-      messages: body.messages.length,
-      ...(config.logPromptContent ? { prompt_preview: JSON.stringify(body.messages).slice(0, 1000) } : {}),
-    }));
+    logMeta(requestId, body, clientWantsStream, meta, started);
   } catch (error) {
     const aborted = controller.signal.aborted;
     const status = error?.status || (aborted ? 504 : 502);
     const message = aborted ? 'Upstream request timed out or was cancelled' : (error?.message || 'Proxy error');
 
     console.error(JSON.stringify({
-      level: 'error', request_id: requestId, route: 'chat', status,
+      level: 'error',
+      request_id: requestId,
+      route: 'chat',
+      status,
       elapsed_ms: Date.now() - started,
       message,
       details: error?.details && !config.logPromptContent ? summarizeDetails(error.details) : error?.details,
@@ -167,7 +196,17 @@ async function handleChat(req, res) {
         },
       });
     }
-    if (!res.writableEnded) res.end();
+
+    // If an SSE response already started, close it cleanly enough for Janitor to stop waiting.
+    if (!res.writableEnded) {
+      try {
+        res.write(`data: ${JSON.stringify({
+          error: { message, type: 'proxy_error', request_id: requestId },
+        })}\n\n`);
+        res.write('data: [DONE]\n\n');
+      } catch {}
+      res.end();
+    }
   } finally {
     clearTimeout(timeout);
   }
@@ -190,15 +229,22 @@ const server = http.createServer(async (req, res) => {
   if (req.method === 'GET' && url.pathname === '/') {
     return sendJson(res, 200, {
       name: 'janitor-openrouter-proxy',
+      version: '2',
       status: 'ok',
       endpoint: '/v1/chat/completions',
       output_mode: config.outputMode,
+      translator_model: config.translatorModel,
       provider_pinned: config.providers.length > 0,
     });
   }
 
   if (req.method === 'GET' && url.pathname === '/health') {
-    return sendJson(res, 200, { status: 'ok', uptime_s: Math.round(process.uptime()) });
+    return sendJson(res, 200, {
+      status: 'ok',
+      version: '2',
+      output_mode: config.outputMode,
+      uptime_s: Math.round(process.uptime()),
+    });
   }
 
   if (req.method === 'POST' && url.pathname === '/v1/chat/completions') {
@@ -216,4 +262,5 @@ server.listen(config.port, '0.0.0.0', () => {
   console.log(`[proxy] output mode: ${config.outputMode}`);
   console.log(`[proxy] provider: ${config.providers.join(', ') || 'OpenRouter automatic routing'}`);
   console.log(`[proxy] model: ${config.forceModel || 'client-selected'}`);
+  console.log(`[proxy] translator: ${config.translatorModel}`);
 });

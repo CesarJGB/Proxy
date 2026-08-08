@@ -16,10 +16,13 @@ function csv(value) {
     .filter(Boolean);
 }
 
-const outputMode = String(process.env.OUTPUT_MODE || 'auto').toLowerCase();
-if (!['prompt', 'auto', 'strict'].includes(outputMode)) {
-  throw new Error('OUTPUT_MODE must be one of: prompt, auto, strict');
+const outputMode = String(process.env.OUTPUT_MODE || 'smart').toLowerCase();
+if (!['prompt', 'smart', 'auto', 'strict'].includes(outputMode)) {
+  throw new Error('OUTPUT_MODE must be one of: prompt, smart, auto, strict');
 }
+
+const smartDetectChars = asInt(process.env.SMART_DETECT_CHARS, 500, 100, 4000);
+const smartMaxDetectChars = asInt(process.env.SMART_MAX_DETECT_CHARS, 1000, smartDetectChars, 8000);
 
 export const config = Object.freeze({
   port: asInt(process.env.PORT, 3000, 1, 65535),
@@ -35,9 +38,16 @@ export const config = Object.freeze({
   openRouterReferer: process.env.OPENROUTER_HTTP_REFERER?.trim() || '',
   openRouterTitle: process.env.OPENROUTER_X_TITLE?.trim() || 'Janitor OpenRouter Proxy',
   corsOrigins: csv(process.env.CORS_ORIGIN || '*'),
+
   outputMode,
-  translatorModel: process.env.TRANSLATOR_MODEL?.trim() || '',
+  smartDetectChars,
+  smartMaxDetectChars,
+
+  // V2 default: very fast/cheap localization model. :nitro = provider sort by throughput.
+  translatorModel: process.env.TRANSLATOR_MODEL?.trim() || 'openai/gpt-oss-20b:nitro',
   translatorProvider: csv(process.env.TRANSLATOR_PROVIDER),
+  translatorReasoningEffort: process.env.TRANSLATOR_REASONING_EFFORT?.trim() || 'low',
+
   emptyResponseRetry: asInt(process.env.EMPTY_RESPONSE_RETRY, 1, 0, 2),
   minCompletionTokens: asInt(process.env.MIN_COMPLETION_TOKENS, 0, 0, 65536),
   reasoningEffort: process.env.REASONING_EFFORT?.trim() || '',
@@ -67,5 +77,9 @@ export function assertConfig() {
 
   if (config.dataCollection && !['allow', 'deny'].includes(config.dataCollection)) {
     throw new Error('DATA_COLLECTION must be allow or deny');
+  }
+
+  if (config.translatorReasoningEffort && !['minimal', 'low', 'medium', 'high'].includes(config.translatorReasoningEffort)) {
+    throw new Error('TRANSLATOR_REASONING_EFFORT must be minimal, low, medium, or high');
   }
 }

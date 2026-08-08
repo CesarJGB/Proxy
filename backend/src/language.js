@@ -75,10 +75,22 @@ export function languageScore(text) {
   return { es, en, words: words.length };
 }
 
-export function shouldRewriteToSpanish(text) {
+export function detectOutputLanguage(text) {
   const value = String(text || '').trim();
-  if (!value) return false;
+  if (!value) return 'unknown';
+
   const { es, en, words } = languageScore(value);
-  if (words < 6) return en > es;
-  return en >= 3 && en > es * 1.15;
+  if (words < 6) {
+    if (en > es) return 'en';
+    if (es > en) return 'es';
+    return 'unknown';
+  }
+
+  if (en >= 3 && en > es * 1.15) return 'en';
+  if (es >= 3 && es >= en * 1.05) return 'es';
+  return 'mixed';
+}
+
+export function shouldRewriteToSpanish(text) {
+  return detectOutputLanguage(text) === 'en';
 }
