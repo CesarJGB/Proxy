@@ -1,0 +1,18 @@
+{
+  "name": "janitor-openrouter-proxy",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Zero-dependency OpenAI-compatible proxy for Janitor AI -> OpenRouter with provider pinning, Spanish output enforcement and empty-response recovery.",
+  "type": "module",
+  "main": "src/server.js",
+  "scripts": {
+    "start": "node src/server.js",
+    "start:env": "node --env-file=.env src/server.js",
+    "dev": "node --watch --env-file=.env src/server.js",
+    "test": "node --test",
+    "check": "node --check src/server.js && node --check src/proxy.js && node --check src/language.js && node --check src/config.js"
+  },
+  "engines": {
+    "node": ">=20.6"
+  }
+}
