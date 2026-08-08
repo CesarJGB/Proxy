@@ -209,7 +209,7 @@ export async function streamPassthrough(input, res, signal) {
     return json;
   }
 
-  res.status(200);
+  res.statusCode = 200;
   res.setHeader('Content-Type', 'text/event-stream; charset=utf-8');
   res.setHeader('Cache-Control', 'no-cache, no-transform');
   res.setHeader('Connection', 'keep-alive');
@@ -239,7 +239,7 @@ export function sendBufferedAsSse(res, json) {
   const created = json?.created || Math.floor(Date.now() / 1000);
   const content = typeof message.content === 'string' ? message.content : '';
 
-  res.status(200);
+  res.statusCode = 200;
   res.setHeader('Content-Type', 'text/event-stream; charset=utf-8');
   res.setHeader('Cache-Control', 'no-cache, no-transform');
   res.setHeader('Connection', 'keep-alive');
