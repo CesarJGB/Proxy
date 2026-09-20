@@ -169,7 +169,7 @@ export async function rewriteToSpanish(text, originalModel, signal) {
   return { text: rewritten, model: payload.model };
 }
 
-export async function completeBuffered(input, signal) {
+export async function completeBuffered(input, signal, context = {}) {
   const started = Date.now();
   let attempts = 0;
   let json;
@@ -178,23 +178,55 @@ export async function completeBuffered(input, signal) {
   let generationMs = 0;
 
   while (attempts <= config.emptyResponseRetry) {
+    const attemptNumber = attempts + 1;
+    context.attempt = attemptNumber;
+    context.attempts = attemptNumber;
     const generationStarted = Date.now();
     const payload = preparePayload(input, { stream: false, retry: attempts > 0 });
-    const response = await callOpenRouter(payload, signal);
-    json = await readOpenRouterJson(response);
+    let response;
+    try {
+      context.stage = 'upstream_connect';
+      response = await callOpenRouter(payload, signal);
+      context.stage = 'upstream_response';
+      json = await readOpenRouterJson(response);
+    } catch (err) {
+      context.stage = context.stage || 'upstream';
+      context.onAttemptFailed?.(err, {
+        attempt: attemptNumber,
+        attempts: attemptNumber,
+        stage: context.stage,
+        retryable: false,
+      });
+      throw err;
+    }
     generationMs += Date.now() - generationStarted;
 
     content = extractContent(json).trim();
     reasoningChars = reasoningSize(json);
     if (content) break;
-    attempts += 1;
-  }
 
-  if (!content) {
-    const err = new Error('Model returned no visible content after retrying');
-    err.status = 502;
-    err.details = { reasoning_chars: reasoningChars, attempts: attempts + 1 };
-    throw err;
+    attempts += 1;
+    const canRetry = attempts <= config.emptyResponseRetry;
+    const emptyErr = new Error('Model returned no visible content');
+    emptyErr.status = 200;
+    emptyErr.details = { reasoning_chars: reasoningChars, attempt: attemptNumber };
+    context.stage = 'generation';
+    context.onAttemptFailed?.(emptyErr, {
+      attempt: attemptNumber,
+      attempts,
+      stage: 'generation',
+      retryable: canRetry,
+      errorType: 'empty_response',
+      errorCode: 'no_visible_content',
+      upstreamStatus: response?.status || 200,
+    });
+
+    if (!canRetry) {
+      const err = new Error('Model returned no visible content after retrying');
+      err.status = 502;
+      err.details = { reasoning_chars: reasoningChars, attempts };
+      throw err;
+    }
   }
 
   let rewritten = false;
@@ -205,8 +237,20 @@ export async function completeBuffered(input, signal) {
   const shouldRewrite = mode === 'strict' || ((mode === 'auto' || mode === 'smart') && shouldRewriteToSpanish(content));
 
   if (shouldRewrite) {
+    context.stage = 'rewrite';
     const rewriteStarted = Date.now();
-    const result = await rewriteToSpanish(content, config.forceModel || input?.model, signal);
+    let result;
+    try {
+      result = await rewriteToSpanish(content, config.forceModel || input?.model, signal);
+    } catch (err) {
+      context.onAttemptFailed?.(err, {
+        attempt: attempts + 1,
+        attempts: attempts + 1,
+        stage: 'rewrite',
+        retryable: false,
+      });
+      throw err;
+    }
     rewriteMs = Date.now() - rewriteStarted;
     content = result.text;
     translatorModel = result.model;
@@ -322,25 +366,50 @@ export function parseSseEvent(rawEvent) {
   };
 }
 
-export async function streamPassthrough(input, res, signal) {
+export async function streamPassthrough(input, res, signal, context = {}) {
   const payload = preparePayload(input, { stream: true });
-  const response = await callOpenRouter(payload, signal);
-
-  if (!response.ok) {
-    const json = await readOpenRouterJson(response); // throws
-    return json;
+  context.attempt = 1;
+  context.attempts = 1;
+  let response;
+  try {
+    context.stage = 'upstream_connect';
+    response = await callOpenRouter(payload, signal);
+    context.stage = 'upstream_response';
+    if (!response.ok) {
+      const json = await readOpenRouterJson(response); // throws
+      return json;
+    }
+  } catch (err) {
+    context.onAttemptFailed?.(err, {
+      attempt: 1,
+      attempts: 1,
+      stage: context.stage || 'upstream',
+      retryable: false,
+    });
+    throw err;
   }
 
   startSseResponse(res);
+  context.stage = 'stream';
 
   let bytes = 0;
-  for await (const chunk of response.body) {
-    const buffer = Buffer.from(chunk);
-    bytes += buffer.length;
-    if (!res.write(buffer)) await new Promise((resolve) => res.once('drain', resolve));
+  try {
+    for await (const chunk of response.body) {
+      const buffer = Buffer.from(chunk);
+      bytes += buffer.length;
+      if (!res.write(buffer)) await new Promise((resolve) => res.once('drain', resolve));
+    }
+  } catch (err) {
+    context.onAttemptFailed?.(err, {
+      attempt: 1,
+      attempts: 1,
+      stage: 'stream',
+      retryable: false,
+    });
+    throw err;
   }
   res.end();
-  return { bytes };
+  return { bytes, attempts: 1, stream_strategy: 'raw_passthrough' };
 }
 
 function completionBase(model) {
@@ -403,17 +472,34 @@ async function streamRewriteToSpanish(text, originalModel, res, signal) {
   };
 }
 
-export async function streamSmart(input, res, signal) {
+export async function streamSmart(input, res, signal, context = {}) {
   const totalStarted = Date.now();
   let attempts = 0;
   let bufferingNoticeSent = false;
 
   while (attempts <= config.emptyResponseRetry) {
+    const attemptNumber = attempts + 1;
+    context.attempt = attemptNumber;
+    context.attempts = attemptNumber;
     const generationStarted = Date.now();
     const payload = preparePayload(input, { stream: true, retry: attempts > 0 });
-    const response = await callOpenRouter(payload, signal);
-    if (!response.ok) {
-      await readOpenRouterJson(response); // throws
+    let response;
+    try {
+      context.stage = 'upstream_connect';
+      response = await callOpenRouter(payload, signal);
+      context.stage = 'upstream_response';
+      if (!response.ok) {
+        await readOpenRouterJson(response); // throws
+      }
+    } catch (err) {
+      context.stage = context.stage || 'upstream';
+      context.onAttemptFailed?.(err, {
+        attempt: attemptNumber,
+        attempts: attemptNumber,
+        stage: context.stage,
+        retryable: false,
+      });
+      throw err;
     }
 
     // Only commit HTTP 200/SSE to Janitor after OpenRouter accepted the request.
@@ -431,44 +517,55 @@ export async function streamSmart(input, res, signal) {
     let decisionMs = 0;
     let passThroughStarted = false;
 
-    for await (const rawEvent of iterateSseEvents(response.body)) {
-      const parsed = parseSseEvent(rawEvent);
+    context.stage = 'stream';
+    try {
+      for await (const rawEvent of iterateSseEvents(response.body)) {
+        const parsed = parseSseEvent(rawEvent);
 
-      if (parsed.kind === 'chunk') {
-        content += parsed.content || '';
-        reasoningChars += parsed.reasoningChars || 0;
-      }
-
-      if (decision === 'pending') {
-        bufferedEvents.push(rawEvent);
-
-        if (content.length >= config.smartDetectChars) {
-          languageDetected = detectOutputLanguage(content);
-
-          if (languageDetected === 'en') {
-            decision = 'rewrite';
-            decisionMs = Date.now() - generationStarted;
-            bufferedEvents = [];
-          } else if (languageDetected === 'es') {
-            decision = 'pass';
-            decisionMs = Date.now() - generationStarted;
-            for (const event of bufferedEvents) await writeRawSseEvent(res, event);
-            bufferedEvents = [];
-            passThroughStarted = true;
-          } else if (content.length >= config.smartMaxDetectChars) {
-            decision = shouldRewriteToSpanish(content) ? 'rewrite' : 'pass';
-            decisionMs = Date.now() - generationStarted;
-            if (decision === 'pass') {
-              for (const event of bufferedEvents) await writeRawSseEvent(res, event);
-              passThroughStarted = true;
-            }
-            bufferedEvents = [];
-          }
+        if (parsed.kind === 'chunk') {
+          content += parsed.content || '';
+          reasoningChars += parsed.reasoningChars || 0;
         }
-      } else if (decision === 'pass') {
-        await writeRawSseEvent(res, rawEvent);
+
+        if (decision === 'pending') {
+          bufferedEvents.push(rawEvent);
+
+          if (content.length >= config.smartDetectChars) {
+            languageDetected = detectOutputLanguage(content);
+
+            if (languageDetected === 'en') {
+              decision = 'rewrite';
+              decisionMs = Date.now() - generationStarted;
+              bufferedEvents = [];
+            } else if (languageDetected === 'es') {
+              decision = 'pass';
+              decisionMs = Date.now() - generationStarted;
+              for (const event of bufferedEvents) await writeRawSseEvent(res, event);
+              bufferedEvents = [];
+              passThroughStarted = true;
+            } else if (content.length >= config.smartMaxDetectChars) {
+              decision = shouldRewriteToSpanish(content) ? 'rewrite' : 'pass';
+              decisionMs = Date.now() - generationStarted;
+              if (decision === 'pass') {
+                for (const event of bufferedEvents) await writeRawSseEvent(res, event);
+                passThroughStarted = true;
+              }
+              bufferedEvents = [];
+            }
+          }
+        } else if (decision === 'pass') {
+          await writeRawSseEvent(res, rawEvent);
+        }
+        // decision === 'rewrite': continue consuming source silently.
       }
-      // decision === 'rewrite': continue consuming source silently.
+    } catch (err) {
+      context.onAttemptFailed?.(err, {
+        attempt: attemptNumber,
+        attempts: attemptNumber,
+        stage: 'stream',
+        retryable: false,
+      });
+      throw err;
     }
 
     const generationMs = Date.now() - generationStarted;
@@ -476,14 +573,29 @@ export async function streamSmart(input, res, signal) {
 
     if (!trimmedContent) {
       attempts += 1;
-      if (attempts <= config.emptyResponseRetry) {
+      const canRetry = attempts <= config.emptyResponseRetry;
+      const emptyErr = new Error('Model returned no visible content');
+      emptyErr.status = 200;
+      emptyErr.details = { reasoning_chars: reasoningChars, attempt: attemptNumber };
+      context.stage = 'stream';
+      context.onAttemptFailed?.(emptyErr, {
+        attempt: attemptNumber,
+        attempts,
+        stage: 'stream',
+        retryable: canRetry,
+        errorType: 'empty_response',
+        errorCode: 'no_visible_content',
+        upstreamStatus: response?.status || 200,
+      });
+
+      if (canRetry) {
         await writeWithBackpressure(res, ': proxy-retrying-empty-response\n\n');
         continue;
       }
 
       const err = new Error('Model returned no visible content after retrying');
       err.status = 502;
-      err.details = { reasoning_chars: reasoningChars, attempts: attempts + 1 };
+      err.details = { reasoning_chars: reasoningChars, attempts };
       throw err;
     }
 
@@ -517,12 +629,24 @@ export async function streamSmart(input, res, signal) {
       };
     }
 
-    const rewrite = await streamRewriteToSpanish(
-      trimmedContent,
-      config.forceModel || input?.model,
-      res,
-      signal,
-    );
+    context.stage = 'rewrite';
+    let rewrite;
+    try {
+      rewrite = await streamRewriteToSpanish(
+        trimmedContent,
+        config.forceModel || input?.model,
+        res,
+        signal,
+      );
+    } catch (err) {
+      context.onAttemptFailed?.(err, {
+        attempt: attemptNumber,
+        attempts: attemptNumber,
+        stage: 'rewrite',
+        retryable: false,
+      });
+      throw err;
+    }
     res.end();
 
     return {
