@@ -14,6 +14,105 @@ export function clearLogListeners() {
 const REDACTED_KEYS = /^(authorization|proxy-authorization|bearer|api[_-]?key|token|secret|password|cookie|set-cookie)$/i;
 const SENSITIVE_VALUE_REGEX = /(Bearer\s+)[A-Za-z0-9_\-\.]+|sk-[A-Za-z0-9_\-\.]+/gi;
 
+const SAFE_DETAIL_KEYS = new Set([
+  'status',
+  'status_code',
+  'statuscode',
+  'http_status',
+  'code',
+  'error_code',
+  'errorcode',
+  'provider',
+  'provider_name',
+  'providers',
+  'type',
+  'error_type',
+  'errortype',
+  'id',
+  'request_id',
+  'requestid',
+  'provider_id',
+  'providerid',
+  'model',
+  'attempt',
+  'attempts',
+  'retry',
+  'retries',
+  'retryable',
+  'retrying',
+  'reasoning_chars',
+  'message',
+  'error_message',
+  'errormessage',
+  'error',
+  'metadata',
+  'details',
+  'cause',
+]);
+
+const SENSITIVE_OR_CONTENT_KEYS = /^(authorization|proxy-authorization|bearer|api[_-]?key|token|secret|password|cookie|set-cookie|messages?|prompts?|inputs?|outputs?|responses?|requests?|request_body|body|completions?|contents?|text|raw|payloads?|headers?)$/i;
+
+export function sanitizeErrorDetails(details, depth = 0, seen = new WeakSet()) {
+  if (details == null) return undefined;
+  if (depth > 6) return '[truncated_depth]';
+
+  if (typeof details === 'string') {
+    let clean = details.replace(SENSITIVE_VALUE_REGEX, '$1[REDACTED]');
+    if (clean.length > 1000) {
+      clean = `${clean.slice(0, 1000)}... [truncated ${clean.length - 1000} chars]`;
+    }
+    return clean;
+  }
+
+  if (typeof details === 'number' || typeof details === 'boolean') {
+    return details;
+  }
+
+  if (typeof details === 'function' || typeof details === 'symbol') {
+    return undefined;
+  }
+
+  if (typeof details === 'object') {
+    if (seen.has(details)) return '[circular]';
+    seen.add(details);
+
+    if (Array.isArray(details)) {
+      const cleanedArray = details
+        .slice(0, 20)
+        .map((item) => sanitizeErrorDetails(item, depth + 1, seen))
+        .filter((item) => item !== undefined);
+      return cleanedArray.length ? cleanedArray : undefined;
+    }
+
+    const cleanObj = {};
+    for (const [k, v] of Object.entries(details)) {
+      if (SENSITIVE_OR_CONTENT_KEYS.test(k)) {
+        continue;
+      }
+      const normalizedKey = k.toLowerCase().replace(/[-_]/g, '');
+      const isSafe = SAFE_DETAIL_KEYS.has(k.toLowerCase()) || SAFE_DETAIL_KEYS.has(normalizedKey);
+      if (!isSafe) {
+        continue;
+      }
+
+      if (v != null && typeof v === 'object') {
+        const sanitizedChild = sanitizeErrorDetails(v, depth + 1, seen);
+        if (sanitizedChild !== undefined && (typeof sanitizedChild !== 'object' || Object.keys(sanitizedChild).length > 0)) {
+          cleanObj[k] = sanitizedChild;
+        }
+      } else {
+        const sanitizedVal = sanitizeValue(v, depth + 1, seen);
+        if (sanitizedVal !== undefined) {
+          cleanObj[k] = sanitizedVal;
+        }
+      }
+    }
+    return Object.keys(cleanObj).length > 0 ? cleanObj : undefined;
+  }
+
+  return undefined;
+}
+
 export function sanitizeValue(value, depth = 0, seen = new WeakSet()) {
   if (value == null) return value;
   if (depth > 6) return '[truncated_depth]';
@@ -65,7 +164,7 @@ export function classifyError(error, {
   stage = 'internal',
 } = {}) {
   // 1. Client closed connection
-  if (clientDisconnected || error?.name === 'ClientDisconnectError' || error?.message === 'Client disconnected') {
+  if (clientDisconnected || error?.name === 'ClientDisconnectError' || error?.code === 'client_disconnected' || error?.message === 'Client disconnected') {
     return {
       errorType: 'client_closed_connection',
       errorCode: 'client_disconnected',
@@ -97,7 +196,18 @@ export function classifyError(error, {
     };
   }
 
-  // 4. Authentication error
+  // 4. CORS forbidden
+  if (stage === 'cors' || error?.type === 'cors_forbidden' || error?.code === 'CORS_FORBIDDEN' || error?.message === 'Origin not allowed') {
+    return {
+      errorType: 'cors_forbidden',
+      errorCode: 403,
+      upstreamStatus: null,
+      errorMessage: error?.message || 'Origin not allowed',
+      clientDisconnected: false,
+    };
+  }
+
+  // 5. Authentication error
   if (error?.type === 'authentication_error' || error?.status === 401 || stage === 'auth') {
     return {
       errorType: 'authentication_error',
@@ -108,7 +218,7 @@ export function classifyError(error, {
     };
   }
 
-  // 5. Payload too large
+  // 6. Payload too large
   if (error?.status === 413 || error?.message?.includes('exceeds BODY_LIMIT')) {
     return {
       errorType: 'payload_too_large',
@@ -119,8 +229,8 @@ export function classifyError(error, {
     };
   }
 
-  // 6. Invalid request error
-  if (error?.type === 'invalid_request_error' || (stage === 'validation' && error?.status === 400)) {
+  // 7. Invalid request error
+  if (error?.type === 'invalid_request_error' || (stage === 'validation' && error?.status === 400) || (stage === 'routing' && error?.status === 405)) {
     return {
       errorType: 'invalid_request_error',
       errorCode: error?.status || 400,
@@ -130,7 +240,7 @@ export function classifyError(error, {
     };
   }
 
-  // 7. Parsing error
+  // 8. Parsing error
   if (error?.type === 'parsing_error' || error?.message?.includes('not valid JSON') || error?.message?.includes('non-JSON response') || error instanceof SyntaxError) {
     return {
       errorType: 'parsing_error',
@@ -141,7 +251,7 @@ export function classifyError(error, {
     };
   }
 
-  // 8. Empty response error
+  // 9. Empty response error
   if (error?.message?.includes('no visible content')) {
     return {
       errorType: 'empty_response',
@@ -152,7 +262,7 @@ export function classifyError(error, {
     };
   }
 
-  // 9. Upstream HTTP error
+  // 10. Upstream HTTP error
   if (error?.status && error.status >= 400) {
     return {
       errorType: 'upstream_http_error',
@@ -163,7 +273,7 @@ export function classifyError(error, {
     };
   }
 
-  // 10. Upstream connection closed / network error
+  // 11. Upstream connection closed / network error
   const msg = String(error?.message || '').toLowerCase();
   const causeCode = error?.cause?.code || error?.cause?.name;
   const code = error?.code || causeCode;
@@ -190,10 +300,10 @@ export function classifyError(error, {
     };
   }
 
-  // 11. Internal error fallback
+  // 12. Internal error fallback
   return {
     errorType: 'internal_error',
-    errorCode: error?.name || 'internal_error',
+    errorCode: error?.code || (error?.name && error.name !== 'Error' ? error.name : 'internal_error'),
     upstreamStatus: null,
     errorMessage: error?.message || 'Internal proxy error',
     clientDisconnected: false,
@@ -270,6 +380,9 @@ export function logAttemptFailed({
     stage,
   });
 
+  const rawDetails = details || error?.details;
+  const sanitizedDetails = sanitizeErrorDetails(rawDetails);
+
   const record = {
     level: retryable ? 'warn' : 'error',
     event: 'upstream_attempt_failed',
@@ -289,8 +402,8 @@ export function logAttemptFailed({
     error_message: sanitizeValue(errorMessage || error?.message || classified.errorMessage),
     client_disconnected: clientDisconnected || classified.clientDisconnected,
     retryable: Boolean(retryable),
-    final: !retryable,
-    ...(details || error?.details ? { details: sanitizeValue(details || error?.details) } : {}),
+    final: false,
+    ...(sanitizedDetails ? { details: sanitizedDetails } : {}),
   };
   emitLog(record);
 }
@@ -340,6 +453,7 @@ export function logRequestCompleted({
     ...(sourceChars !== undefined ? { source_chars: sourceChars } : {}),
     reasoning_chars: reasoningChars,
     messages: Number.isFinite(messages) ? messages : 0,
+    final: true,
     ...(promptPreview && config.logPromptContent ? { prompt_preview: sanitizeValue(promptPreview) } : {}),
   };
   emitLog(record);
@@ -375,6 +489,8 @@ export function logRequestFailed({
   });
 
   const finalErrorMessage = sanitizeValue(errorMessage || error?.message || classified.errorMessage);
+  const rawDetails = details || error?.details;
+  const sanitizedDetails = sanitizeErrorDetails(rawDetails);
 
   const record = {
     level: 'error',
@@ -398,7 +514,7 @@ export function logRequestFailed({
     final: true,
     status: clientStatus,
     message: finalErrorMessage,
-    ...(details || error?.details ? { details: sanitizeValue(details || error?.details) } : {}),
+    ...(sanitizedDetails ? { details: sanitizedDetails } : {}),
   };
   emitLog(record);
 }

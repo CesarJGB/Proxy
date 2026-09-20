@@ -3,13 +3,14 @@ import assert from 'node:assert/strict';
 import { EventEmitter } from 'node:events';
 import { Readable } from 'node:stream';
 import { config } from '../src/config.js';
-import { handleChat } from '../src/server.js';
+import { handleChat, server } from '../src/server.js';
 import { onLog, clearLogListeners } from '../src/logger.js';
 
 class FakeRequest extends EventEmitter {
   constructor(body, headers = {}) {
     super();
     this.method = 'POST';
+    this.url = '/v1/chat/completions';
     this.headers = {
       authorization: `Bearer ${config.proxyApiKey}`,
       'content-type': 'application/json',
@@ -39,6 +40,10 @@ class FakeResponse extends EventEmitter {
     this.headers[name.toLowerCase()] = value;
   }
 
+  getHeader(name) {
+    return this.headers[name.toLowerCase()];
+  }
+
   flushHeaders() {
     this.headersSent = true;
   }
@@ -60,6 +65,14 @@ class FakeResponse extends EventEmitter {
     if (!this.writableEnded) {
       this.emit('close');
     }
+  }
+}
+
+class BackpressureHangingResponse extends FakeResponse {
+  write(value) {
+    this.headersSent = true;
+    this.output += String(value);
+    return false;
   }
 }
 
@@ -96,7 +109,7 @@ function finishEvent(model = 'test-model') {
   })}\n\ndata: [DONE]\n\n`;
 }
 
-test('1. request exitosa registra request_started y request_completed con el mismo request_id', async () => {
+test('1. éxito normal: registra request_started y request_completed con el mismo request_id', async () => {
   const originalFetch = global.fetch;
   const logs = [];
   const unsubscribe = onLog((entry) => logs.push(entry));
@@ -129,14 +142,18 @@ test('1. request exitosa registra request_started y request_completed con el mis
     assert.equal(completed.stream, true);
     assert.equal(completed.model, 'deepseek/deepseek-v4-flash');
     assert.equal(completed.route, 'chat');
+    assert.equal(completed.final, true);
     assert.ok(Number.isFinite(completed.elapsed_ms));
+
+    const terminals = logs.filter((l) => l.request_id === completed.request_id && l.final === true);
+    assert.equal(terminals.length, 1, 'Debe haber exactamente un evento final: true');
   } finally {
     global.fetch = originalFetch;
     unsubscribe();
   }
 });
 
-test('2. upstream devuelve 500 registra upstream_attempt_failed y request_failed con el mismo request_id', async () => {
+test('2. HTTP 500 upstream: registra upstream_attempt_failed y request_failed con el mismo request_id', async () => {
   const originalFetch = global.fetch;
   const logs = [];
   const unsubscribe = onLog((entry) => logs.push(entry));
@@ -170,16 +187,19 @@ test('2. upstream devuelve 500 registra upstream_attempt_failed y request_failed
     assert.equal(attemptFailed.error_type, 'upstream_http_error');
     assert.equal(attemptFailed.upstream_status, 500);
     assert.equal(attemptFailed.retryable, false);
-    assert.equal(attemptFailed.final, true);
+    assert.equal(attemptFailed.final, false, 'Intento fallido debe tener final: false');
     assert.equal(requestFailed.upstream_status, 500);
-    assert.equal(requestFailed.final, true);
+    assert.equal(requestFailed.final, true, 'Terminal request_failed debe tener final: true');
+
+    const terminals = logs.filter((l) => l.request_id === requestFailed.request_id && l.final === true);
+    assert.equal(terminals.length, 1, 'Debe haber exactamente un evento final: true');
   } finally {
     global.fetch = originalFetch;
     unsubscribe();
   }
 });
 
-test('3. conexión upstream falla antes de responder registra error de conexión con mismo request_id', async () => {
+test('3. conexión rechazada antes de respuesta: registra error de conexión con mismo request_id', async () => {
   const originalFetch = global.fetch;
   const logs = [];
   const unsubscribe = onLog((entry) => logs.push(entry));
@@ -211,15 +231,19 @@ test('3. conexión upstream falla antes de responder registra error de conexión
     assert.equal(attemptFailed.stage, 'upstream_connect');
     assert.equal(attemptFailed.error_type, 'upstream_closed_connection');
     assert.equal(attemptFailed.error_code, 'ECONNREFUSED');
+    assert.equal(attemptFailed.final, false);
     assert.equal(requestFailed.error_type, 'upstream_closed_connection');
     assert.equal(requestFailed.final, true);
+
+    const terminals = logs.filter((l) => l.request_id === requestFailed.request_id && l.final === true);
+    assert.equal(terminals.length, 1, 'Debe haber exactamente un evento final: true');
   } finally {
     global.fetch = originalFetch;
     unsubscribe();
   }
 });
 
-test('4. conexión upstream se corta durante streaming registra el error tras enviar headers', async () => {
+test('4. corte upstream durante streaming: registra el error tras enviar headers', async () => {
   const originalFetch = global.fetch;
   const logs = [];
   const unsubscribe = onLog((entry) => logs.push(entry));
@@ -259,18 +283,22 @@ test('4. conexión upstream se corta durante streaming registra el error tras en
     assert.equal(attemptFailed.request_id, requestFailed.request_id);
     assert.equal(attemptFailed.stage, 'stream');
     assert.equal(attemptFailed.error_type, 'upstream_closed_connection');
+    assert.equal(attemptFailed.final, false);
     assert.equal(requestFailed.stream, true);
     assert.equal(requestFailed.final, true);
 
     // Janitor receives SSE error event and [DONE]
     assert.match(res.output, /data: \[DONE\]/);
+
+    const terminals = logs.filter((l) => l.request_id === requestFailed.request_id && l.final === true);
+    assert.equal(terminals.length, 1, 'Debe haber exactamente un evento final: true');
   } finally {
     global.fetch = originalFetch;
     unsubscribe();
   }
 });
 
-test('5. primer intento falla y segundo funciona reconstruye intento 1 falló -> intento 2 ok', async () => {
+test('5. primer intento vacío + segundo exitoso: reconstruye intento 1 falló -> intento 2 ok', async () => {
   const originalFetch = global.fetch;
   const logs = [];
   const unsubscribe = onLog((entry) => logs.push(entry));
@@ -279,10 +307,8 @@ test('5. primer intento falla y segundo funciona reconstruye intento 1 falló ->
   global.fetch = async () => {
     calls += 1;
     if (calls === 1) {
-      // Empty visible response (e.g. reasoning only or whitespace)
       return okStream([finishEvent()]);
     }
-    // Second attempt produces valid Spanish content
     const spanish = 'Respuesta en español válida para el roleplay. '.repeat(10);
     return okStream([contentEvent(spanish), finishEvent()]);
   };
@@ -309,14 +335,18 @@ test('5. primer intento falla y segundo funciona reconstruye intento 1 falló ->
 
     assert.ok(completed, 'Debe registrar request_completed al segundo intento');
     assert.equal(completed.attempts, 2);
+    assert.equal(completed.final, true);
     assert.equal(attempt1.request_id, completed.request_id);
+
+    const terminals = logs.filter((l) => l.request_id === completed.request_id && l.final === true);
+    assert.equal(terminals.length, 1, 'Debe haber exactamente un evento final: true');
   } finally {
     global.fetch = originalFetch;
     unsubscribe();
   }
 });
 
-test('6. todos los intentos fallan registra cada intento y el request_failed final con mismo request_id', async () => {
+test('6. todos los retries vacíos agotados: registra cada intento y el request_failed final con mismo request_id', async () => {
   const originalFetch = global.fetch;
   const logs = [];
   const unsubscribe = onLog((entry) => logs.push(entry));
@@ -349,7 +379,7 @@ test('6. todos los intentos fallan registra cada intento y el request_failed fin
 
     assert.ok(attempt2, 'Debe registrar intento 2 fallido');
     assert.equal(attempt2.retryable, false);
-    assert.equal(attempt2.final, true);
+    assert.equal(attempt2.final, false, 'Intento 2 upstream_attempt_failed debe tener final: false');
 
     assert.ok(requestFailed, 'Debe registrar request_failed final');
     assert.equal(requestFailed.final, true);
@@ -357,20 +387,22 @@ test('6. todos los intentos fallan registra cada intento y el request_failed fin
 
     assert.equal(attempt1.request_id, requestFailed.request_id);
     assert.equal(attempt2.request_id, requestFailed.request_id);
+
+    const terminals = logs.filter((l) => l.request_id === requestFailed.request_id && l.final === true);
+    assert.equal(terminals.length, 1, 'Debe haber exactamente un evento final: true');
   } finally {
     global.fetch = originalFetch;
     unsubscribe();
   }
 });
 
-test('7. excepción interna inesperada registra request_failed con error_type internal_error', async () => {
+test('7. validación 400 por payload inválido registra request_failed con invalid_request_error', async () => {
   const logs = [];
   const unsubscribe = onLog((entry) => logs.push(entry));
 
-  // Request with invalid messages structure that bypasses initial check or triggers internal error
   const req = new FakeRequest({
     model: 'test-model',
-    messages: null, // triggers validation error
+    messages: null,
   });
   const res = new FakeResponse();
 
@@ -383,23 +415,65 @@ test('7. excepción interna inesperada registra request_failed con error_type in
     assert.ok(failed, 'Debe registrar request_failed');
     assert.equal(failed.stage, 'validation');
     assert.equal(failed.error_type, 'invalid_request_error');
+    assert.equal(failed.error_code, 400);
     assert.equal(failed.final, true);
+
+    const completed = logs.find((l) => l.event === 'request_completed');
+    assert.equal(completed, undefined);
+
+    const terminals = logs.filter((l) => l.request_id === failed.request_id && l.final === true);
+    assert.equal(terminals.length, 1, 'Debe haber exactamente un evento final: true');
   } finally {
     unsubscribe();
   }
 });
 
-test('8. cliente cancela un stream registra client_disconnected y client_closed_connection', async () => {
+test('8. excepción interna REAL registra request_failed con error_type internal_error', async () => {
   const originalFetch = global.fetch;
   const logs = [];
   const unsubscribe = onLog((entry) => logs.push(entry));
 
-  let fetchAborted = false;
+  global.fetch = async () => {
+    throw new Error('boom inesperado');
+  };
+
+  try {
+    const req = new FakeRequest({
+      model: 'deepseek/deepseek-v4-flash',
+      messages: [{ role: 'user', content: 'Hola' }],
+      stream: false,
+    });
+    const res = new FakeResponse();
+
+    await handleChat(req, res);
+
+    assert.equal(res.statusCode, 502);
+
+    const failed = logs.find((l) => l.event === 'request_failed');
+    assert.ok(failed, 'Debe registrar request_failed');
+    assert.equal(failed.error_type, 'internal_error');
+    assert.equal(failed.final, true);
+    assert.match(failed.error_message, /boom inesperado/);
+
+    const completed = logs.find((l) => l.event === 'request_completed');
+    assert.equal(completed, undefined);
+
+    const terminals = logs.filter((l) => l.request_id === failed.request_id && l.final === true);
+    assert.equal(terminals.length, 1, 'Debe haber exactamente un evento final: true');
+  } finally {
+    global.fetch = originalFetch;
+    unsubscribe();
+  }
+});
+
+test('9. cliente cancela stream normal registra client_disconnected y client_closed_connection', async () => {
+  const originalFetch = global.fetch;
+  const logs = [];
+  const unsubscribe = onLog((entry) => logs.push(entry));
+
   global.fetch = async (_url, { signal }) => {
-    signal.addEventListener('abort', () => { fetchAborted = true; });
     async function* hangingStream() {
       yield Buffer.from(contentEvent('Parte 1'));
-      // Wait for abort
       await new Promise((resolve) => setTimeout(resolve, 50));
       if (signal.aborted) {
         const err = new Error('The operation was aborted');
@@ -424,7 +498,6 @@ test('8. cliente cancela un stream registra client_disconnected y client_closed_
     });
     const res = new FakeResponse();
 
-    // Simulate client closing connection while handling
     setTimeout(() => {
       res.simulateClientDisconnect();
     }, 10);
@@ -437,13 +510,60 @@ test('8. cliente cancela un stream registra client_disconnected y client_closed_
     assert.equal(failed.error_type, 'client_closed_connection');
     assert.equal(failed.error_code, 'client_disconnected');
     assert.equal(failed.final, true);
+
+    const terminals = logs.filter((l) => l.request_id === failed.request_id && l.final === true);
+    assert.equal(terminals.length, 1, 'Debe haber exactamente un evento final: true');
   } finally {
     global.fetch = originalFetch;
     unsubscribe();
   }
 });
 
-test('9. fallo de autenticación 401 registra request_failed antes de contactar al proveedor', async () => {
+test('10. cliente cancela mientras esperamos drain: handleChat termina y registra client_closed_connection', async () => {
+  const originalFetch = global.fetch;
+  const logs = [];
+  const unsubscribe = onLog((entry) => logs.push(entry));
+
+  global.fetch = async () => {
+    const spanish = 'Ella lo mira fijamente mientras la lluvia cae. '.repeat(10);
+    return okStream([contentEvent(spanish), finishEvent()]);
+  };
+
+  try {
+    const req = new FakeRequest({
+      model: 'deepseek/deepseek-v4-flash',
+      messages: [{ role: 'user', content: 'Hola' }],
+      stream: true,
+    });
+    const res = new BackpressureHangingResponse();
+
+    // The client disconnects while writeWithBackpressure is waiting on drain
+    setTimeout(() => {
+      res.simulateClientDisconnect();
+    }, 10);
+
+    await handleChat(req, res);
+
+    const failedList = logs.filter((l) => l.event === 'request_failed');
+    assert.equal(failedList.length, 1, 'Debe registrar exactamente un request_failed');
+
+    const failed = failedList[0];
+    assert.equal(failed.error_type, 'client_closed_connection');
+    assert.equal(failed.client_disconnected, true);
+    assert.equal(failed.final, true);
+
+    const completed = logs.find((l) => l.event === 'request_completed');
+    assert.equal(completed, undefined);
+
+    const terminals = logs.filter((l) => l.request_id === failed.request_id && l.final === true);
+    assert.equal(terminals.length, 1, 'Debe haber exactamente un evento final: true');
+  } finally {
+    global.fetch = originalFetch;
+    unsubscribe();
+  }
+});
+
+test('11. auth 401 registra request_failed antes de contactar al proveedor', async () => {
   const logs = [];
   const unsubscribe = onLog((entry) => logs.push(entry));
 
@@ -465,24 +585,77 @@ test('9. fallo de autenticación 401 registra request_failed antes de contactar 
     assert.equal(failed.error_code, 401);
     assert.equal(failed.final, true);
     assert.equal(failed.attempts, 0);
+
+    const terminals = logs.filter((l) => l.request_id === failed.request_id && l.final === true);
+    assert.equal(terminals.length, 1, 'Debe haber exactamente un evento final: true');
   } finally {
     unsubscribe();
   }
 });
 
-test('10. sanitización no expone API keys ni autorización en los logs', async () => {
+test('12. CORS 403 en /v1/chat/completions registra request_failed antes de handleChat con request_id', async () => {
+  const logs = [];
+  const unsubscribe = onLog((entry) => logs.push(entry));
+  const oldCors = process.env.CORS_ORIGIN;
+  process.env.CORS_ORIGIN = 'https://trusted-site.com';
+
+  try {
+    const req = new FakeRequest(
+      { model: 'deepseek/deepseek-v4-flash', messages: [{ role: 'user', content: 'Hola' }] },
+      { origin: 'https://malicious-site.com' }
+    );
+    req.url = '/v1/chat/completions';
+    const res = new FakeResponse();
+
+    await new Promise((resolve) => {
+      res.once('finish', resolve);
+      server.emit('request', req, res);
+    });
+
+    assert.equal(res.statusCode, 403);
+    const requestId = res.getHeader('x-proxy-request-id');
+    assert.ok(requestId, 'Debe incluir header X-Proxy-Request-Id');
+
+    const failed = logs.find((l) => l.event === 'request_failed');
+    assert.ok(failed, 'Debe registrar request_failed');
+    assert.equal(failed.request_id, requestId);
+    assert.equal(failed.stage, 'cors');
+    assert.equal(failed.status, 403);
+    assert.equal(failed.final, true);
+    assert.equal(failed.error_type, 'cors_forbidden');
+
+    const terminals = logs.filter((l) => l.request_id === requestId && l.final === true);
+    assert.equal(terminals.length, 1, 'Debe haber exactamente un evento terminal');
+  } finally {
+    if (oldCors !== undefined) process.env.CORS_ORIGIN = oldCors;
+    else delete process.env.CORS_ORIGIN;
+    unsubscribe();
+  }
+});
+
+test('13. sanitización de secretos y contenido del usuario en error.details', async () => {
   const originalFetch = global.fetch;
   const logs = [];
   const unsubscribe = onLog((entry) => logs.push(entry));
 
   global.fetch = async () => ({
     ok: false,
-    status: 401,
+    status: 502,
     async text() {
       return JSON.stringify({
         error: {
-          message: 'Invalid key Bearer secret_openrouter_key_xyz',
-          metadata: { api_key: 'sk-abcdef123456', password: 'supersecretpassword' },
+          message: 'Error de proveedor con Bearer secret_openrouter_key_xyz',
+          type: 'upstream_error',
+          code: 'bad_gateway',
+          prompt: 'prompt secreto anidado en error',
+        },
+        metadata: {
+          api_key: 'sk-abcdef123456',
+          Authorization: 'Bearer supersecretpassword',
+          messages: [{ role: 'user', content: 'prompt secreto de prueba que no debe verse' }],
+          prompt: 'prompt de alto nivel confidencial',
+          response: 'respuesta del modelo confidencial',
+          output: 'salida generada confidencial',
         },
       });
     },
@@ -498,14 +671,74 @@ test('10. sanitización no expone API keys ni autorización en los logs', async 
     await handleChat(req, res);
 
     const failed = logs.find((l) => l.event === 'request_failed');
-    assert.ok(failed);
+    assert.ok(failed, 'Debe registrar request_failed');
 
     const jsonStr = JSON.stringify(failed);
+    // Secrets
     assert.doesNotMatch(jsonStr, /secret_openrouter_key_xyz/);
     assert.doesNotMatch(jsonStr, /sk-abcdef123456/);
     assert.doesNotMatch(jsonStr, /supersecretpassword/);
+    // User content / prompts / responses
+    assert.doesNotMatch(jsonStr, /prompt secreto de prueba que no debe verse/);
+    assert.doesNotMatch(jsonStr, /prompt de alto nivel confidencial/);
+    assert.doesNotMatch(jsonStr, /prompt secreto anidado/);
+    assert.doesNotMatch(jsonStr, /respuesta del modelo confidencial/);
+    assert.doesNotMatch(jsonStr, /salida generada confidencial/);
+
+    // Diagnostic safe keys must still exist
+    assert.equal(failed.details?.error?.type, 'upstream_error');
+    assert.equal(failed.details?.error?.code, 'bad_gateway');
+
+    const terminals = logs.filter((l) => l.request_id === failed.request_id && l.final === true);
+    assert.equal(terminals.length, 1, 'Debe haber exactamente un evento final: true');
   } finally {
     global.fetch = originalFetch;
     unsubscribe();
   }
+});
+
+test('14. excepción inesperada en el handler HTTP exterior genera request_id y request_failed', async () => {
+  const logs = [];
+  const unsubscribe = onLog((entry) => logs.push(entry));
+
+  const req = new FakeRequest(
+    { model: 'test-model', messages: [{ role: 'user', content: 'Hola' }] },
+    {}
+  );
+  // Simulate an unexpected error in routing/middleware by causing headers access to throw
+  Object.defineProperty(req, 'headers', {
+    get() {
+      throw new Error('Unexpected crash in outer HTTP handler');
+    },
+  });
+  req.url = '/v1/chat/completions';
+  const res = new FakeResponse();
+
+  await new Promise((resolve) => {
+    res.once('finish', resolve);
+    server.emit('request', req, res);
+  });
+
+  assert.equal(res.statusCode, 500);
+
+  const clientBody = JSON.parse(res.output);
+  // Client gets generic message, not the internal stack/details
+  assert.equal(clientBody.error.message, 'Internal server error');
+  assert.equal(clientBody.error.type, 'internal_error');
+
+  const failed = logs.find((l) => l.event === 'request_failed');
+  assert.ok(failed, 'Debe registrar request_failed en fallo inesperado exterior');
+  assert.ok(failed.request_id, 'Debe incluir request_id');
+  assert.ok(failed.route, 'Debe incluir route');
+  assert.equal(failed.stage, 'routing');
+  assert.ok(Number.isFinite(failed.elapsed_ms));
+  assert.equal(failed.error_type, 'internal_error');
+  assert.equal(failed.error_code, 'internal_error');
+  assert.equal(failed.error_message, 'Unexpected crash in outer HTTP handler');
+  assert.equal(failed.final, true);
+
+  const terminals = logs.filter((l) => l.request_id === failed.request_id && l.final === true);
+  assert.equal(terminals.length, 1, 'Debe haber exactamente un evento terminal');
+
+  unsubscribe();
 });

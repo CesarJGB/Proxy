@@ -10,10 +10,12 @@ import {
   streamSmart,
 } from './proxy.js';
 import {
+  classifyError,
   logAttemptFailed,
   logRequestCompleted,
   logRequestFailed,
   logRequestStarted,
+  sanitizeErrorDetails,
   sanitizeValue,
 } from './logger.js';
 
@@ -28,16 +30,28 @@ function parseByteLimit(value) {
 
 const bodyLimitBytes = parseByteLimit(config.bodyLimit);
 
+function getCorsOrigins() {
+  if (process.env.CORS_ORIGIN !== undefined) {
+    return String(process.env.CORS_ORIGIN)
+      .split(',')
+      .map((item) => item.trim())
+      .filter(Boolean);
+  }
+  return config.corsOrigins;
+}
+
 function originAllowed(origin) {
   if (!origin) return true;
-  if (config.corsOrigins.includes('*')) return true;
-  return config.corsOrigins.includes(origin);
+  const origins = getCorsOrigins();
+  if (origins.includes('*')) return true;
+  return origins.includes(origin);
 }
 
 function applyCors(req, res) {
-  const origin = req.headers.origin;
+  const origin = req.headers?.origin;
+  const origins = getCorsOrigins();
   if (originAllowed(origin)) {
-    res.setHeader('Access-Control-Allow-Origin', config.corsOrigins.includes('*') ? '*' : (origin || ''));
+    res.setHeader('Access-Control-Allow-Origin', origins.includes('*') ? '*' : (origin || ''));
     res.setHeader('Vary', 'Origin');
   }
   res.setHeader('Access-Control-Allow-Headers', 'Authorization, Content-Type, X-Requested-With');
@@ -82,11 +96,13 @@ function bearerToken(req) {
   return auth.startsWith('Bearer ') ? auth.slice(7).trim() : '';
 }
 
-export async function handleChat(req, res) {
-  const requestId = crypto.randomUUID();
-  res.setHeader('X-Proxy-Request-Id', requestId);
+export async function handleChat(req, res, { requestId: initialRequestId, started: initialStarted } = {}) {
+  const requestId = initialRequestId || crypto.randomUUID();
+  if (!res.headersSent && (!res.getHeader || !res.getHeader('x-proxy-request-id'))) {
+    res.setHeader('X-Proxy-Request-Id', requestId);
+  }
 
-  const started = Date.now();
+  const started = initialStarted || Date.now();
   let clientDisconnected = false;
   let timedOut = false;
   let terminalLogged = false;
@@ -164,6 +180,9 @@ export async function handleChat(req, res) {
   }
 
   function onAttemptFailed(err, info = {}) {
+    if (clientDisconnected || info.clientDisconnected || err?.name === 'ClientDisconnectError' || err?.message === 'Client disconnected') {
+      return;
+    }
     currentAttempt = info.attempt || currentAttempt || 1;
     totalAttempts = Math.max(totalAttempts, info.attempts || currentAttempt);
     currentStage = info.stage || currentStage;
@@ -182,7 +201,7 @@ export async function handleChat(req, res) {
       errorType: info.errorType,
       errorCode: info.errorCode,
       upstreamStatus: info.upstreamStatus,
-      clientDisconnected,
+      clientDisconnected: false,
       timedOut,
       retryable: Boolean(info.retryable),
       details: err?.details,
@@ -267,11 +286,14 @@ export async function handleChat(req, res) {
     currentAttempt = 1;
     totalAttempts = 1;
     const { json, meta } = await completeBuffered(body, controller.signal, context);
-    if (clientWantsStream) sendBufferedAsSse(res, json);
+    if (clientWantsStream) await sendBufferedAsSse(res, json, controller.signal);
     else sendJson(res, 200, json);
 
     emitTerminalSuccess(meta);
   } catch (error) {
+    if (clientDisconnected || error?.name === 'ClientDisconnectError' || error?.message === 'Client disconnected') {
+      clientDisconnected = true;
+    }
     currentStage = error?.stage || currentStage;
     const status = error?.status || (clientDisconnected ? 499 : (timedOut ? 504 : 502));
     const message = clientDisconnected
@@ -286,13 +308,13 @@ export async function handleChat(req, res) {
           message,
           type: 'proxy_error',
           request_id: requestId,
-          ...(error?.details ? { upstream: sanitizeValue(error.details) } : {}),
+          ...(error?.details ? { upstream: sanitizeErrorDetails(error.details) } : {}),
         },
       });
     }
 
     // If an SSE response already started, close it cleanly enough for Janitor to stop waiting.
-    if (!res.writableEnded) {
+    if (!res.writableEnded && !clientDisconnected) {
       try {
         res.write(`data: ${JSON.stringify({
           error: { message, type: 'proxy_error', request_id: requestId },
@@ -309,7 +331,23 @@ export async function handleChat(req, res) {
 }
 
 export const server = http.createServer(async (req, res) => {
+  const started = Date.now();
+  let requestId = null;
+  let isChatRoute = false;
   try {
+    let url;
+    try {
+      url = new URL(req.url || '/', `http://${req.headers?.host || 'localhost'}`);
+    } catch {
+      url = null;
+    }
+
+    isChatRoute = url?.pathname === '/v1/chat/completions';
+    if (isChatRoute) {
+      requestId = crypto.randomUUID();
+      res.setHeader('X-Proxy-Request-Id', requestId);
+    }
+
     applyCors(req, res);
     const origin = req.headers?.origin;
 
@@ -318,10 +356,25 @@ export const server = http.createServer(async (req, res) => {
       return res.end();
     }
     if (origin && !originAllowed(origin)) {
+      if (isChatRoute) {
+        logRequestFailed({
+          requestId,
+          route: 'chat',
+          stage: 'cors',
+          elapsedMs: Date.now() - started,
+          errorType: 'cors_forbidden',
+          errorCode: 403,
+          errorMessage: 'Origin not allowed',
+          clientStatus: 403,
+          final: true,
+        });
+      }
       return sendJson(res, 403, { error: { message: 'Origin not allowed' } });
     }
 
-    const url = new URL(req.url || '/', `http://${req.headers?.host || 'localhost'}`);
+    if (!url) {
+      return sendJson(res, 400, { error: { message: 'Invalid URL', type: 'invalid_request_error' } });
+    }
 
     if (req.method === 'GET' && url.pathname === '/') {
       return sendJson(res, 200, {
@@ -344,15 +397,13 @@ export const server = http.createServer(async (req, res) => {
       });
     }
 
-    if (url.pathname === '/v1/chat/completions') {
+    if (isChatRoute) {
       if (req.method !== 'POST') {
-        const requestId = crypto.randomUUID();
-        res.setHeader('X-Proxy-Request-Id', requestId);
         logRequestFailed({
           requestId,
           route: 'chat',
           stage: 'routing',
-          elapsedMs: 0,
+          elapsedMs: Date.now() - started,
           errorType: 'invalid_request_error',
           errorCode: 405,
           errorMessage: 'Method not allowed',
@@ -361,11 +412,31 @@ export const server = http.createServer(async (req, res) => {
         });
         return sendJson(res, 405, { error: { message: 'Method not allowed', type: 'invalid_request_error' } });
       }
-      return handleChat(req, res);
+      return handleChat(req, res, { requestId, started });
     }
 
     return sendJson(res, 404, { error: { message: 'Not found' } });
-  } catch {
+  } catch (err) {
+    requestId = requestId || crypto.randomUUID();
+    if (!res.headersSent) {
+      try {
+        res.setHeader('X-Proxy-Request-Id', requestId);
+      } catch {}
+    }
+    const elapsedMs = Date.now() - started;
+    const classified = classifyError(err, { stage: 'routing' });
+    logRequestFailed({
+      requestId,
+      route: isChatRoute ? 'chat' : 'router',
+      stage: 'routing',
+      elapsedMs,
+      error: err,
+      errorType: classified.errorType || 'internal_error',
+      errorCode: classified.errorCode || 'internal_error',
+      errorMessage: err?.message || 'Internal server error',
+      clientStatus: 500,
+      final: true,
+    });
     if (!res.headersSent) {
       sendJson(res, 500, { error: { message: 'Internal server error', type: 'internal_error' } });
     }

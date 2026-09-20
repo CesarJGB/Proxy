@@ -289,15 +289,91 @@ function startSseResponse(res) {
   res.flushHeaders?.();
 }
 
-async function writeWithBackpressure(res, value) {
-  if (!res.write(value)) {
-    await new Promise((resolve) => res.once('drain', resolve));
+export async function writeWithBackpressure(res, value, signal) {
+  if (signal?.aborted) {
+    const reason = signal.reason;
+    if (reason instanceof Error) throw reason;
+    const err = new Error(typeof reason === 'string' ? reason : 'The operation was aborted');
+    err.name = 'AbortError';
+    throw err;
   }
+  if (res.destroyed || res.writableEnded) {
+    const err = new Error('Client disconnected');
+    err.name = 'ClientDisconnectError';
+    err.code = 'client_disconnected';
+    err.status = 499;
+    throw err;
+  }
+
+  const ok = res.write(value);
+  if (ok) return;
+
+  await new Promise((resolve, reject) => {
+    let cleanup;
+
+    const onDrain = () => {
+      cleanup();
+      resolve();
+    };
+
+    const onClose = () => {
+      cleanup();
+      if (!res.writableEnded) {
+        const err = new Error('Client disconnected');
+        err.name = 'ClientDisconnectError';
+        err.code = 'client_disconnected';
+        err.status = 499;
+        reject(err);
+      } else {
+        resolve();
+      }
+    };
+
+    const onError = (err) => {
+      cleanup();
+      reject(err);
+    };
+
+    const onAbort = () => {
+      cleanup();
+      const reason = signal?.reason;
+      if (reason instanceof Error) {
+        reject(reason);
+      } else {
+        const err = new Error(typeof reason === 'string' ? reason : 'The operation was aborted');
+        err.name = 'AbortError';
+        reject(err);
+      }
+    };
+
+    cleanup = () => {
+      res.removeListener('drain', onDrain);
+      res.removeListener('close', onClose);
+      res.removeListener('error', onError);
+      if (signal) {
+        signal.removeEventListener('abort', onAbort);
+      }
+    };
+
+    res.once('drain', onDrain);
+    res.once('close', onClose);
+    res.once('error', onError);
+    if (signal) {
+      if (signal.aborted) {
+        onAbort();
+        return;
+      }
+      signal.addEventListener('abort', onAbort, { once: true });
+    }
+    if (res.destroyed || res.writableEnded) {
+      onClose();
+    }
+  });
 }
 
-async function writeRawSseEvent(res, rawEvent) {
+export async function writeRawSseEvent(res, rawEvent, signal) {
   if (!rawEvent) return;
-  await writeWithBackpressure(res, `${rawEvent}\n\n`);
+  await writeWithBackpressure(res, `${rawEvent}\n\n`, signal);
 }
 
 export async function* iterateSseEvents(body) {
@@ -397,18 +473,20 @@ export async function streamPassthrough(input, res, signal, context = {}) {
     for await (const chunk of response.body) {
       const buffer = Buffer.from(chunk);
       bytes += buffer.length;
-      if (!res.write(buffer)) await new Promise((resolve) => res.once('drain', resolve));
+      await writeWithBackpressure(res, buffer, signal);
     }
   } catch (err) {
-    context.onAttemptFailed?.(err, {
-      attempt: 1,
-      attempts: 1,
-      stage: 'stream',
-      retryable: false,
-    });
+    if (err?.name !== 'ClientDisconnectError' && !signal?.aborted) {
+      context.onAttemptFailed?.(err, {
+        attempt: 1,
+        attempts: 1,
+        stage: 'stream',
+        retryable: false,
+      });
+    }
     throw err;
   }
-  res.end();
+  if (!res.writableEnded) res.end();
   return { bytes, attempts: 1, stream_strategy: 'raw_passthrough' };
 }
 
@@ -421,12 +499,12 @@ function completionBase(model) {
   };
 }
 
-async function writeSyntheticChunk(res, base, delta, finishReason = null) {
+async function writeSyntheticChunk(res, base, delta, finishReason = null, signal) {
   const event = {
     ...base,
     choices: [{ index: 0, delta, finish_reason: finishReason }],
   };
-  await writeWithBackpressure(res, `data: ${JSON.stringify(event)}\n\n`);
+  await writeWithBackpressure(res, `data: ${JSON.stringify(event)}\n\n`, signal);
 }
 
 async function streamRewriteToSpanish(text, originalModel, res, signal) {
@@ -450,20 +528,20 @@ async function streamRewriteToSpanish(text, originalModel, res, signal) {
     if (!parsed.content) continue;
 
     if (!startedVisibleOutput) {
-      await writeSyntheticChunk(res, base, { role: 'assistant' });
+      await writeSyntheticChunk(res, base, { role: 'assistant' }, null, signal);
       startedVisibleOutput = true;
     }
 
     translatedChars += parsed.content.length;
-    await writeSyntheticChunk(res, base, { content: parsed.content });
+    await writeSyntheticChunk(res, base, { content: parsed.content }, null, signal);
   }
 
   if (!startedVisibleOutput || translatedChars === 0) {
     throw new Error('Translator returned an empty streaming response');
   }
 
-  await writeSyntheticChunk(res, base, {}, finishReason);
-  await writeWithBackpressure(res, 'data: [DONE]\n\n');
+  await writeSyntheticChunk(res, base, {}, finishReason, signal);
+  await writeWithBackpressure(res, 'data: [DONE]\n\n', signal);
 
   return {
     rewrite_ms: Date.now() - rewriteStarted,
@@ -505,7 +583,7 @@ export async function streamSmart(input, res, signal, context = {}) {
     // Only commit HTTP 200/SSE to Janitor after OpenRouter accepted the request.
     startSseResponse(res);
     if (!bufferingNoticeSent) {
-      await writeWithBackpressure(res, ': proxy-smart-buffering\n\n');
+      await writeWithBackpressure(res, ': proxy-smart-buffering\n\n', signal);
       bufferingNoticeSent = true;
     }
 
@@ -540,31 +618,33 @@ export async function streamSmart(input, res, signal, context = {}) {
             } else if (languageDetected === 'es') {
               decision = 'pass';
               decisionMs = Date.now() - generationStarted;
-              for (const event of bufferedEvents) await writeRawSseEvent(res, event);
+              for (const event of bufferedEvents) await writeRawSseEvent(res, event, signal);
               bufferedEvents = [];
               passThroughStarted = true;
             } else if (content.length >= config.smartMaxDetectChars) {
               decision = shouldRewriteToSpanish(content) ? 'rewrite' : 'pass';
               decisionMs = Date.now() - generationStarted;
               if (decision === 'pass') {
-                for (const event of bufferedEvents) await writeRawSseEvent(res, event);
+                for (const event of bufferedEvents) await writeRawSseEvent(res, event, signal);
                 passThroughStarted = true;
               }
               bufferedEvents = [];
             }
           }
         } else if (decision === 'pass') {
-          await writeRawSseEvent(res, rawEvent);
+          await writeRawSseEvent(res, rawEvent, signal);
         }
         // decision === 'rewrite': continue consuming source silently.
       }
     } catch (err) {
-      context.onAttemptFailed?.(err, {
-        attempt: attemptNumber,
-        attempts: attemptNumber,
-        stage: 'stream',
-        retryable: false,
-      });
+      if (err?.name !== 'ClientDisconnectError' && !signal?.aborted) {
+        context.onAttemptFailed?.(err, {
+          attempt: attemptNumber,
+          attempts: attemptNumber,
+          stage: 'stream',
+          retryable: false,
+        });
+      }
       throw err;
     }
 
@@ -589,7 +669,7 @@ export async function streamSmart(input, res, signal, context = {}) {
       });
 
       if (canRetry) {
-        await writeWithBackpressure(res, ': proxy-retrying-empty-response\n\n');
+        await writeWithBackpressure(res, ': proxy-retrying-empty-response\n\n', signal);
         continue;
       }
 
@@ -605,7 +685,7 @@ export async function streamSmart(input, res, signal, context = {}) {
       decisionMs = generationMs;
 
       if (decision === 'pass') {
-        for (const event of bufferedEvents) await writeRawSseEvent(res, event);
+        for (const event of bufferedEvents) await writeRawSseEvent(res, event, signal);
         passThroughStarted = true;
       }
       bufferedEvents = [];
@@ -639,15 +719,17 @@ export async function streamSmart(input, res, signal, context = {}) {
         signal,
       );
     } catch (err) {
-      context.onAttemptFailed?.(err, {
-        attempt: attemptNumber,
-        attempts: attemptNumber,
-        stage: 'rewrite',
-        retryable: false,
-      });
+      if (err?.name !== 'ClientDisconnectError' && !signal?.aborted) {
+        context.onAttemptFailed?.(err, {
+          attempt: attemptNumber,
+          attempts: attemptNumber,
+          stage: 'rewrite',
+          retryable: false,
+        });
+      }
       throw err;
     }
-    res.end();
+    if (!res.writableEnded) res.end();
 
     return {
       elapsed_ms: Date.now() - totalStarted,
@@ -674,7 +756,7 @@ function splitForSse(text, size = 120) {
   return chunks;
 }
 
-export function sendBufferedAsSse(res, json) {
+export async function sendBufferedAsSse(res, json, signal) {
   const message = json?.choices?.[0]?.message || {};
   const id = json?.id || `chatcmpl-proxy-${crypto.randomUUID()}`;
   const model = json?.model || 'proxy';
@@ -684,12 +766,12 @@ export function sendBufferedAsSse(res, json) {
   startSseResponse(res);
 
   const base = { id, object: 'chat.completion.chunk', created, model };
-  res.write(`data: ${JSON.stringify({ ...base, choices: [{ index: 0, delta: { role: 'assistant' }, finish_reason: null }] })}\n\n`);
+  await writeWithBackpressure(res, `data: ${JSON.stringify({ ...base, choices: [{ index: 0, delta: { role: 'assistant' }, finish_reason: null }] })}\n\n`, signal);
   for (const part of splitForSse(content)) {
-    res.write(`data: ${JSON.stringify({ ...base, choices: [{ index: 0, delta: { content: part }, finish_reason: null }] })}\n\n`);
+    await writeWithBackpressure(res, `data: ${JSON.stringify({ ...base, choices: [{ index: 0, delta: { content: part }, finish_reason: null }] })}\n\n`, signal);
   }
   const finishReason = json?.choices?.[0]?.finish_reason || 'stop';
-  res.write(`data: ${JSON.stringify({ ...base, choices: [{ index: 0, delta: {}, finish_reason: finishReason }] })}\n\n`);
-  res.write('data: [DONE]\n\n');
-  res.end();
+  await writeWithBackpressure(res, `data: ${JSON.stringify({ ...base, choices: [{ index: 0, delta: {}, finish_reason: finishReason }] })}\n\n`, signal);
+  await writeWithBackpressure(res, 'data: [DONE]\n\n', signal);
+  if (!res.writableEnded) res.end();
 }
