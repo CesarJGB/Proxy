@@ -1,11 +1,11 @@
-# Janitor → OpenRouter Proxy
+# Janitor → OpenRouter / DeepSeek Proxy
 
-Proxy OpenAI-compatible pensado para usar **Janitor AI con OpenRouter** desde un VPS/Coolify.
+Proxy OpenAI-compatible pensado para usar **Janitor AI con OpenRouter o DeepSeek directo** desde un VPS/Coolify.
 
 ## Qué resuelve
 
 - Endpoint compatible: `POST /v1/chat/completions`.
-- OpenRouter API key guardada únicamente en el servidor.
+- La API key del proveedor se guarda únicamente en el servidor.
 - Una `PROXY_API_KEY` separada para Janitor.
 - Inyección persistente de una política de salida en español latinoamericano.
 - Puede fijar un proveedor de OpenRouter para evitar cambios de latencia entre proveedores.
@@ -17,11 +17,63 @@ Proxy OpenAI-compatible pensado para usar **Janitor AI con OpenRouter** desde un
 
 OpenRouter usa `POST https://openrouter.ai/api/v1/chat/completions`; el streaming se realiza mediante SSE. OpenRouter también permite controlar proveedores con `provider.only`, `provider.order` y `allow_fallbacks`.
 
+## Selección de proveedor
+
+OpenRouter sigue siendo el proveedor predeterminado si no defines `AI_PROVIDER`.
+
+OpenRouter:
+
+```env
+AI_PROVIDER=openrouter
+OPENROUTER_API_KEY=<tu-clave-de-openrouter>
+PROXY_API_KEY=<tu-clave-actual-del-proxy>
+FORCE_MODEL=deepseek/deepseek-v4-flash
+OUTPUT_MODE=smart
+```
+
+DeepSeek directo (configuración sencilla y rápida recomendada):
+
+```env
+AI_PROVIDER=deepseek
+DEEPSEEK_API_KEY=<tu-clave-de-deepseek>
+PROXY_API_KEY=<tu-clave-actual-del-proxy>
+FORCE_MODEL=deepseek-flash
+OUTPUT_MODE=prompt
+```
+
+En Coolify actualiza estas variables en **Environment Variables** y redespliega.
+Solo es obligatoria la API key del proveedor seleccionado, además de `PROXY_API_KEY`.
+Janitor conserva exactamente la misma URL y `PROXY_API_KEY`; `FORCE_MODEL` sustituye
+el modelo enviado por Janitor, por lo que tampoco necesitas cambiar su configuración.
+
+DeepSeek usa `https://api.deepseek.com/chat/completions`. El proxy envía solamente
+los campos admitidos por su [API oficial](https://api-docs.deepseek.com/api/create-chat-completion/),
+conservando los mensajes y la misma política de español. Las opciones `OPENROUTER_PROVIDER`,
+`PROVIDER_SORT`, `DATA_COLLECTION`, `ALLOW_PROVIDER_FALLBACKS`, `REQUIRE_PARAMETERS`
+y los encabezados de OpenRouter solo se aplican a OpenRouter.
+
+Para DeepSeek se conservan `thinking` y `reasoning_effort` del request;
+`REASONING_EFFORT`, si está definido, sustituye este último. Los valores nativos
+son `none`, `low`, `high` y `max` (también admite los alias `minimal`, `medium`, `xhigh`).
+`none` desactiva el pensamiento. `max_tokens` limita toda la salida, incluido el
+razonamiento; `max_completion_tokens` se convierte a `max_tokens` cuando no existe
+este último. `MIN_COMPLETION_TOKENS` sigue aplicándose. Los objetos `reasoning`
+y `REASONING_MAX_TOKENS` de OpenRouter no se envían a DeepSeek.
+
+`OUTPUT_MODE=prompt` evita la traducción secundaria y conserva el streaming directo.
+También siguen disponibles `smart` (detección local mientras recibe SSE), `auto`
+y `strict`. Si estos modos necesitan traducir, usan el proveedor seleccionado:
+OpenRouter conserva `openai/gpt-oss-20b:nitro`; DeepSeek usa `deepseek-flash`, con
+`TRANSLATOR_REASONING_EFFORT=none` por defecto para traducir sin pensamiento.
+Puedes definir `TRANSLATOR_MODEL` con un modelo compatible con ese proveedor
+(por ejemplo `deepseek-flash` o `deepseek-v4-pro` para DeepSeek). Al cambiar de
+proveedor elimina o actualiza cualquier `TRANSLATOR_MODEL` explícito del anterior.
+
 ## Modos de idioma
 
 ### `OUTPUT_MODE=prompt`
 
-Una sola llamada. Conserva el streaming real de OpenRouter y es la opción más rápida/barata. El proxy inserta la política de español dentro del primer mensaje `system` y la refuerza al final de ese mismo bloque.
+Una sola llamada. Conserva el streaming real del proveedor y es la opción más rápida/barata. El proxy inserta la política de español dentro del primer mensaje `system` y la refuerza al final de ese mismo bloque.
 
 ### `OUTPUT_MODE=auto` — recomendado para empezar
 
@@ -72,10 +124,10 @@ API Key:
 <el valor de PROXY_API_KEY>
 
 Model:
-<modelo exacto de OpenRouter>
+<modelo del proveedor; FORCE_MODEL lo sustituye si está definido>
 ```
 
-**No pongas la API key real de OpenRouter en Janitor.**
+**No pongas la API key real del proveedor en Janitor.**
 
 ### Si Janitor tiene un campo que añade `/chat/completions` automáticamente
 

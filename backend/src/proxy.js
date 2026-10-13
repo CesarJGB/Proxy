@@ -7,7 +7,27 @@ import {
   shouldRewriteToSpanish,
 } from './language.js';
 
-const OPENROUTER_URL = 'https://openrouter.ai/api/v1/chat/completions';
+const UPSTREAM_URL = config.aiProvider === 'deepseek'
+  ? 'https://api.deepseek.com/chat/completions'
+  : 'https://openrouter.ai/api/v1/chat/completions';
+const UPSTREAM_NAME = config.aiProvider === 'deepseek' ? 'DeepSeek' : 'OpenRouter';
+
+// Only documented DeepSeek request fields; leave message contents and history intact.
+const DEEPSEEK_FIELDS = new Set([
+  'model', 'messages', 'stream', 'stream_options', 'max_tokens', 'thinking',
+  'reasoning_effort', 'temperature', 'top_p', 'stop', 'response_format',
+  'tools', 'tool_choice', 'logprobs', 'top_logprobs', 'user_id',
+]);
+
+function deepSeekPayload(payload) {
+  const result = Object.fromEntries(Object.entries(payload).filter(([key]) => DEEPSEEK_FIELDS.has(key)));
+  // DeepSeek rejects stream_options on buffered requests (including empty-response retries).
+  if (!result.stream) delete result.stream_options;
+  else if (result.stream_options) {
+    result.stream_options = { include_usage: result.stream_options.include_usage };
+  }
+  return result;
+}
 
 function safeEqual(a, b) {
   const aa = Buffer.from(String(a || ''));
@@ -44,8 +64,16 @@ export function preparePayload(input, { stream, retry = false } = {}) {
 
   if (config.forceModel) payload.model = config.forceModel;
 
-  const provider = buildProviderConfig();
-  if (provider) payload.provider = provider;
+  if (config.aiProvider === 'openrouter') {
+    const provider = buildProviderConfig();
+    if (provider) payload.provider = provider;
+  } else {
+    if (payload.max_tokens == null && payload.max_completion_tokens != null) {
+      payload.max_tokens = payload.max_completion_tokens;
+    }
+    delete payload.max_completion_tokens;
+    if (config.reasoningEffort) payload.reasoning_effort = config.reasoningEffort;
+  }
 
   if (config.minCompletionTokens > 0) {
     if ('max_completion_tokens' in payload) {
@@ -55,7 +83,7 @@ export function preparePayload(input, { stream, retry = false } = {}) {
     }
   }
 
-  if (config.reasoningEffort || config.reasoningMaxTokens || config.reasoningExclude) {
+  if (config.aiProvider === 'openrouter' && (config.reasoningEffort || config.reasoningMaxTokens || config.reasoningExclude)) {
     payload.reasoning = typeof payload.reasoning === 'object' && payload.reasoning ? { ...payload.reasoning } : {};
     if (config.reasoningEffort) payload.reasoning.effort = config.reasoningEffort;
     if (config.reasoningMaxTokens) payload.reasoning.max_tokens = config.reasoningMaxTokens;
@@ -68,47 +96,47 @@ export function preparePayload(input, { stream, retry = false } = {}) {
       role: 'system',
       content: 'A visible final answer is required. Do not end after reasoning. Return the actual roleplay response in Spanish in the assistant content field.',
     });
-    if (payload.reasoning && typeof payload.reasoning === 'object') {
+    if (config.aiProvider === 'openrouter' && payload.reasoning && typeof payload.reasoning === 'object') {
       payload.reasoning = { ...payload.reasoning, exclude: true };
       if (!config.reasoningEffort && 'effort' in payload.reasoning) payload.reasoning.effort = 'minimal';
     }
   }
 
-  return payload;
+  return config.aiProvider === 'deepseek' ? deepSeekPayload(payload) : payload;
 }
 
-function openRouterHeaders() {
+function upstreamHeaders() {
   const headers = {
-    Authorization: `Bearer ${config.openRouterApiKey}`,
+    Authorization: `Bearer ${config.aiProvider === 'deepseek' ? config.deepSeekApiKey : config.openRouterApiKey}`,
     'Content-Type': 'application/json',
   };
-  if (config.openRouterReferer) headers['HTTP-Referer'] = config.openRouterReferer;
-  if (config.openRouterTitle) headers['X-Title'] = config.openRouterTitle;
+  if (config.aiProvider === 'openrouter' && config.openRouterReferer) headers['HTTP-Referer'] = config.openRouterReferer;
+  if (config.aiProvider === 'openrouter' && config.openRouterTitle) headers['X-Title'] = config.openRouterTitle;
   return headers;
 }
 
-export async function callOpenRouter(payload, signal) {
-  return fetch(OPENROUTER_URL, {
+export async function callUpstream(payload, signal) {
+  return fetch(UPSTREAM_URL, {
     method: 'POST',
-    headers: openRouterHeaders(),
+    headers: upstreamHeaders(),
     body: JSON.stringify(payload),
     signal,
   });
 }
 
-export async function readOpenRouterJson(response) {
+export async function readUpstreamJson(response) {
   const text = await response.text();
   let json;
   try {
     json = JSON.parse(text);
   } catch {
-    const err = new Error(`OpenRouter returned non-JSON response (${response.status})`);
+    const err = new Error(`${UPSTREAM_NAME} returned non-JSON response (${response.status})`);
     err.status = response.status || 502;
     err.details = text.slice(0, 2000);
     throw err;
   }
   if (!response.ok) {
-    const err = new Error(json?.error?.message || `OpenRouter HTTP ${response.status}`);
+    const err = new Error(json?.error?.message || `${UPSTREAM_NAME} HTTP ${response.status}`);
     err.status = response.status;
     err.details = json;
     throw err;
@@ -151,6 +179,12 @@ function translatorPayload(text, originalModel, stream) {
     },
   };
 
+  if (config.aiProvider === 'deepseek') {
+    delete payload.reasoning;
+    payload.reasoning_effort = config.translatorReasoningEffort;
+    return deepSeekPayload(payload);
+  }
+
   const providers = config.translatorProvider;
   // Do not inherit the roleplay model's global provider sort here:
   // the default translator model uses :nitro, which already means throughput sorting.
@@ -162,8 +196,8 @@ function translatorPayload(text, originalModel, stream) {
 
 export async function rewriteToSpanish(text, originalModel, signal) {
   const payload = translatorPayload(text, originalModel, false);
-  const response = await callOpenRouter(payload, signal);
-  const json = await readOpenRouterJson(response);
+  const response = await callUpstream(payload, signal);
+  const json = await readUpstreamJson(response);
   const rewritten = extractContent(json).trim();
   if (!rewritten) throw new Error('Translator returned an empty response');
   return { text: rewritten, model: payload.model };
@@ -186,9 +220,9 @@ export async function completeBuffered(input, signal, context = {}) {
     let response;
     try {
       context.stage = 'upstream_connect';
-      response = await callOpenRouter(payload, signal);
+      response = await callUpstream(payload, signal);
       context.stage = 'upstream_response';
-      json = await readOpenRouterJson(response);
+      json = await readUpstreamJson(response);
     } catch (err) {
       context.stage = context.stage || 'upstream';
       context.onAttemptFailed?.(err, {
@@ -449,10 +483,10 @@ export async function streamPassthrough(input, res, signal, context = {}) {
   let response;
   try {
     context.stage = 'upstream_connect';
-    response = await callOpenRouter(payload, signal);
+    response = await callUpstream(payload, signal);
     context.stage = 'upstream_response';
     if (!response.ok) {
-      const json = await readOpenRouterJson(response); // throws
+      const json = await readUpstreamJson(response); // throws
       return json;
     }
   } catch (err) {
@@ -510,9 +544,9 @@ async function writeSyntheticChunk(res, base, delta, finishReason = null, signal
 async function streamRewriteToSpanish(text, originalModel, res, signal) {
   const payload = translatorPayload(text, originalModel, true);
   const rewriteStarted = Date.now();
-  const response = await callOpenRouter(payload, signal);
+  const response = await callUpstream(payload, signal);
   if (!response.ok) {
-    await readOpenRouterJson(response); // throws
+    await readUpstreamJson(response); // throws
   }
 
   const base = completionBase(payload.model);
@@ -564,10 +598,10 @@ export async function streamSmart(input, res, signal, context = {}) {
     let response;
     try {
       context.stage = 'upstream_connect';
-      response = await callOpenRouter(payload, signal);
+      response = await callUpstream(payload, signal);
       context.stage = 'upstream_response';
       if (!response.ok) {
-        await readOpenRouterJson(response); // throws
+        await readUpstreamJson(response); // throws
       }
     } catch (err) {
       context.stage = context.stage || 'upstream';
@@ -580,7 +614,7 @@ export async function streamSmart(input, res, signal, context = {}) {
       throw err;
     }
 
-    // Only commit HTTP 200/SSE to Janitor after OpenRouter accepted the request.
+    // Only commit HTTP 200/SSE to Janitor after the upstream accepted the request.
     startSseResponse(res);
     if (!bufferingNoticeSent) {
       await writeWithBackpressure(res, ': proxy-smart-buffering\n\n', signal);

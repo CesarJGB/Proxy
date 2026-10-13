@@ -16,6 +16,11 @@ function csv(value) {
     .filter(Boolean);
 }
 
+const aiProvider = String(process.env.AI_PROVIDER || 'openrouter').trim().toLowerCase();
+if (!['openrouter', 'deepseek'].includes(aiProvider)) {
+  throw new Error('AI_PROVIDER must be one of: openrouter, deepseek');
+}
+
 const outputMode = String(process.env.OUTPUT_MODE || 'smart').toLowerCase();
 if (!['prompt', 'smart', 'auto', 'strict'].includes(outputMode)) {
   throw new Error('OUTPUT_MODE must be one of: prompt, smart, auto, strict');
@@ -27,6 +32,8 @@ const smartMaxDetectChars = asInt(process.env.SMART_MAX_DETECT_CHARS, 1000, smar
 export const config = Object.freeze({
   port: asInt(process.env.PORT, 3000, 1, 65535),
   bodyLimit: process.env.BODY_LIMIT || '12mb',
+  aiProvider,
+  deepSeekApiKey: process.env.DEEPSEEK_API_KEY || '',
   openRouterApiKey: process.env.OPENROUTER_API_KEY || '',
   proxyApiKey: process.env.PROXY_API_KEY || '',
   forceModel: process.env.FORCE_MODEL?.trim() || '',
@@ -43,10 +50,10 @@ export const config = Object.freeze({
   smartDetectChars,
   smartMaxDetectChars,
 
-  // V2 default: very fast/cheap localization model. :nitro = provider sort by throughput.
-  translatorModel: process.env.TRANSLATOR_MODEL?.trim() || 'openai/gpt-oss-20b:nitro',
+  // Keep OpenRouter's V2 translator default; DeepSeek uses a native model.
+  translatorModel: process.env.TRANSLATOR_MODEL?.trim() || (aiProvider === 'deepseek' ? 'deepseek-flash' : 'openai/gpt-oss-20b:nitro'),
   translatorProvider: csv(process.env.TRANSLATOR_PROVIDER),
-  translatorReasoningEffort: process.env.TRANSLATOR_REASONING_EFFORT?.trim() || 'low',
+  translatorReasoningEffort: process.env.TRANSLATOR_REASONING_EFFORT?.trim() || (aiProvider === 'deepseek' ? 'none' : 'low'),
 
   emptyResponseRetry: asInt(process.env.EMPTY_RESPONSE_RETRY, 1, 0, 2),
   minCompletionTokens: asInt(process.env.MIN_COMPLETION_TOKENS, 0, 0, 65536),
@@ -61,7 +68,9 @@ export const config = Object.freeze({
 
 export function assertConfig() {
   const missing = [];
-  if (!config.openRouterApiKey) missing.push('OPENROUTER_API_KEY');
+  if (config.aiProvider === 'deepseek') {
+    if (!config.deepSeekApiKey) missing.push('DEEPSEEK_API_KEY');
+  } else if (!config.openRouterApiKey) missing.push('OPENROUTER_API_KEY');
   if (!config.proxyApiKey) missing.push('PROXY_API_KEY');
   if (missing.length) {
     throw new Error(`Missing required environment variables: ${missing.join(', ')}`);
@@ -71,15 +80,21 @@ export function assertConfig() {
     console.warn('[config] PROXY_API_KEY is short. Use a random value of at least 32 characters.');
   }
 
-  if (config.providerSort && !['price', 'throughput', 'latency'].includes(config.providerSort)) {
+  if (config.aiProvider === 'openrouter' && config.providerSort && !['price', 'throughput', 'latency'].includes(config.providerSort)) {
     throw new Error('PROVIDER_SORT must be empty, price, throughput, or latency');
   }
 
-  if (config.dataCollection && !['allow', 'deny'].includes(config.dataCollection)) {
+  if (config.aiProvider === 'openrouter' && config.dataCollection && !['allow', 'deny'].includes(config.dataCollection)) {
     throw new Error('DATA_COLLECTION must be allow or deny');
   }
 
-  if (config.translatorReasoningEffort && !['minimal', 'low', 'medium', 'high'].includes(config.translatorReasoningEffort)) {
-    throw new Error('TRANSLATOR_REASONING_EFFORT must be minimal, low, medium, or high');
+  const efforts = config.aiProvider === 'deepseek'
+    ? ['none', 'low', 'high', 'max', 'minimal', 'medium', 'xhigh']
+    : ['minimal', 'low', 'medium', 'high'];
+  if (config.translatorReasoningEffort && !efforts.includes(config.translatorReasoningEffort)) {
+    throw new Error(`TRANSLATOR_REASONING_EFFORT must be one of: ${efforts.join(', ')}`);
+  }
+  if (config.aiProvider === 'deepseek' && config.reasoningEffort && !efforts.includes(config.reasoningEffort)) {
+    throw new Error(`REASONING_EFFORT for DeepSeek must be one of: ${efforts.join(', ')}`);
   }
 }

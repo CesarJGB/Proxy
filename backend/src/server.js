@@ -137,7 +137,7 @@ export async function handleChat(req, res, { requestId: initialRequestId, starte
       route: 'chat',
       stream: clientWantsStream,
       model: config.forceModel || body?.model || null,
-      provider: config.providers.join(',') || 'auto',
+      provider: config.aiProvider === 'deepseek' ? 'deepseek' : (config.providers.join(',') || 'auto'),
       outputMode: config.outputMode,
       elapsedMs: meta?.elapsed_ms ?? (Date.now() - started),
       generationMs: meta?.generation_ms ?? 0,
@@ -165,7 +165,7 @@ export async function handleChat(req, res, { requestId: initialRequestId, starte
       route: 'chat',
       stream: clientWantsStream,
       model: config.forceModel || body?.model || null,
-      provider: config.providers.join(',') || 'auto',
+      provider: config.aiProvider === 'deepseek' ? 'deepseek' : (config.providers.join(',') || 'auto'),
       outputMode: config.outputMode,
       attempt: currentAttempt > 0 ? currentAttempt : (totalAttempts > 0 ? totalAttempts : null),
       attempts: totalAttempts,
@@ -191,7 +191,7 @@ export async function handleChat(req, res, { requestId: initialRequestId, starte
       route: 'chat',
       stream: clientWantsStream,
       model: config.forceModel || body?.model || null,
-      provider: config.providers.join(',') || 'auto',
+      provider: config.aiProvider === 'deepseek' ? 'deepseek' : (config.providers.join(',') || 'auto'),
       outputMode: config.outputMode,
       attempt: currentAttempt,
       attempts: totalAttempts,
@@ -250,7 +250,7 @@ export async function handleChat(req, res, { requestId: initialRequestId, starte
       route: 'chat',
       stream: clientWantsStream,
       model: config.forceModel || body.model,
-      provider: config.providers.join(',') || 'auto',
+      provider: config.aiProvider === 'deepseek' ? 'deepseek' : (config.providers.join(',') || 'auto'),
       outputMode: config.outputMode,
       messages: body.messages.length,
     });
@@ -452,7 +452,7 @@ if (isMain) {
   server.listen(config.port, '0.0.0.0', () => {
     console.log(`[proxy] listening on 0.0.0.0:${config.port}`);
     console.log(`[proxy] output mode: ${config.outputMode}`);
-    console.log(`[proxy] provider: ${config.providers.join(', ') || 'OpenRouter automatic routing'}`);
+    console.log(`[proxy] provider: ${config.aiProvider === 'deepseek' ? 'DeepSeek direct' : (config.providers.join(', ') || 'OpenRouter automatic routing')}`);
     console.log(`[proxy] model: ${config.forceModel || 'client-selected'}`);
     console.log(`[proxy] translator: ${config.translatorModel}`);
   });
