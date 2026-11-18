@@ -1,3 +1,5 @@
+import { VENICE_REASONING_EFFORTS, VENICE_TRANSLATOR_MODEL, veniceReasoningEfforts } from './venice.js';
+
 function asBool(value, fallback = false) {
   if (value == null || value === '') return fallback;
   return ['1', 'true', 'yes', 'on'].includes(String(value).toLowerCase());
@@ -17,9 +19,15 @@ function csv(value) {
 }
 
 const aiProvider = String(process.env.AI_PROVIDER || 'openrouter').trim().toLowerCase();
-if (!['openrouter', 'deepseek'].includes(aiProvider)) {
-  throw new Error('AI_PROVIDER must be one of: openrouter, deepseek');
+if (!['openrouter', 'deepseek', 'venice'].includes(aiProvider)) {
+  throw new Error('AI_PROVIDER must be one of: openrouter, deepseek, venice');
 }
+
+const defaultTranslator = {
+  openrouter: 'openai/gpt-oss-20b:nitro',
+  deepseek: 'deepseek-flash',
+  venice: VENICE_TRANSLATOR_MODEL,
+};
 
 const outputMode = String(process.env.OUTPUT_MODE || 'smart').toLowerCase();
 if (!['prompt', 'smart', 'auto', 'strict'].includes(outputMode)) {
@@ -35,6 +43,7 @@ export const config = Object.freeze({
   aiProvider,
   deepSeekApiKey: process.env.DEEPSEEK_API_KEY || '',
   openRouterApiKey: process.env.OPENROUTER_API_KEY || '',
+  veniceApiKey: process.env.VENICE_API_KEY?.trim() || '',
   proxyApiKey: process.env.PROXY_API_KEY || '',
   forceModel: process.env.FORCE_MODEL?.trim() || '',
   providers: csv(process.env.OPENROUTER_PROVIDER),
@@ -50,10 +59,9 @@ export const config = Object.freeze({
   smartDetectChars,
   smartMaxDetectChars,
 
-  // Keep OpenRouter's V2 translator default; DeepSeek uses a native model.
-  translatorModel: process.env.TRANSLATOR_MODEL?.trim() || (aiProvider === 'deepseek' ? 'deepseek-flash' : 'openai/gpt-oss-20b:nitro'),
+  translatorModel: process.env.TRANSLATOR_MODEL?.trim() || defaultTranslator[aiProvider],
   translatorProvider: csv(process.env.TRANSLATOR_PROVIDER),
-  translatorReasoningEffort: process.env.TRANSLATOR_REASONING_EFFORT?.trim() || (aiProvider === 'deepseek' ? 'none' : 'low'),
+  translatorReasoningEffort: process.env.TRANSLATOR_REASONING_EFFORT?.trim() || (aiProvider === 'openrouter' ? 'low' : 'none'),
 
   emptyResponseRetry: asInt(process.env.EMPTY_RESPONSE_RETRY, 1, 0, 2),
   minCompletionTokens: asInt(process.env.MIN_COMPLETION_TOKENS, 0, 0, 65536),
@@ -70,6 +78,8 @@ export function assertConfig() {
   const missing = [];
   if (config.aiProvider === 'deepseek') {
     if (!config.deepSeekApiKey) missing.push('DEEPSEEK_API_KEY');
+  } else if (config.aiProvider === 'venice') {
+    if (!config.veniceApiKey) missing.push('VENICE_API_KEY');
   } else if (!config.openRouterApiKey) missing.push('OPENROUTER_API_KEY');
   if (!config.proxyApiKey) missing.push('PROXY_API_KEY');
   if (missing.length) {
@@ -90,11 +100,19 @@ export function assertConfig() {
 
   const efforts = config.aiProvider === 'deepseek'
     ? ['none', 'low', 'high', 'max', 'minimal', 'medium', 'xhigh']
-    : ['minimal', 'low', 'medium', 'high'];
+    : config.aiProvider === 'venice'
+      ? veniceReasoningEfforts(config.translatorModel)
+      : ['minimal', 'low', 'medium', 'high'];
   if (config.translatorReasoningEffort && !efforts.includes(config.translatorReasoningEffort)) {
     throw new Error(`TRANSLATOR_REASONING_EFFORT must be one of: ${efforts.join(', ')}`);
   }
   if (config.aiProvider === 'deepseek' && config.reasoningEffort && !efforts.includes(config.reasoningEffort)) {
     throw new Error(`REASONING_EFFORT for DeepSeek must be one of: ${efforts.join(', ')}`);
+  }
+  if (config.aiProvider === 'venice' && config.reasoningEffort) {
+    const generationEfforts = config.forceModel ? veniceReasoningEfforts(config.forceModel) : VENICE_REASONING_EFFORTS;
+    if (!generationEfforts.includes(config.reasoningEffort)) {
+      throw new Error(`REASONING_EFFORT for Venice must be one of: ${generationEfforts.join(', ')}`);
+    }
   }
 }

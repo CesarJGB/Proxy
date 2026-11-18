@@ -1,5 +1,6 @@
 import crypto from 'node:crypto';
 import { config } from './config.js';
+import { stripVeniceReasoning, veniceError, venicePayload, veniceReasoningDelta } from './venice.js';
 import {
   buildRewriteMessages,
   detectOutputLanguage,
@@ -7,10 +8,12 @@ import {
   shouldRewriteToSpanish,
 } from './language.js';
 
-const UPSTREAM_URL = config.aiProvider === 'deepseek'
-  ? 'https://api.deepseek.com/chat/completions'
-  : 'https://openrouter.ai/api/v1/chat/completions';
-const UPSTREAM_NAME = config.aiProvider === 'deepseek' ? 'DeepSeek' : 'OpenRouter';
+const IS_VENICE = config.aiProvider === 'venice';
+const { url: UPSTREAM_URL, name: UPSTREAM_NAME, apiKey: UPSTREAM_KEY } = {
+  openrouter: { url: 'https://openrouter.ai/api/v1/chat/completions', name: 'OpenRouter', apiKey: config.openRouterApiKey },
+  deepseek: { url: 'https://api.deepseek.com/chat/completions', name: 'DeepSeek', apiKey: config.deepSeekApiKey },
+  venice: { url: 'https://api.venice.ai/api/v1/chat/completions', name: 'Venice', apiKey: config.veniceApiKey },
+}[config.aiProvider];
 
 // Only documented DeepSeek request fields; leave message contents and history intact.
 const DEEPSEEK_FIELDS = new Set([
@@ -67,7 +70,7 @@ export function preparePayload(input, { stream, retry = false } = {}) {
   if (config.aiProvider === 'openrouter') {
     const provider = buildProviderConfig();
     if (provider) payload.provider = provider;
-  } else {
+  } else if (config.aiProvider === 'deepseek') {
     if (payload.max_tokens == null && payload.max_completion_tokens != null) {
       payload.max_tokens = payload.max_completion_tokens;
     }
@@ -75,7 +78,7 @@ export function preparePayload(input, { stream, retry = false } = {}) {
     if (config.reasoningEffort) payload.reasoning_effort = config.reasoningEffort;
   }
 
-  if (config.minCompletionTokens > 0) {
+  if (!IS_VENICE && config.minCompletionTokens > 0) {
     if ('max_completion_tokens' in payload) {
       payload.max_completion_tokens = Math.max(Number(payload.max_completion_tokens) || 0, config.minCompletionTokens);
     } else {
@@ -102,12 +105,20 @@ export function preparePayload(input, { stream, retry = false } = {}) {
     }
   }
 
+  if (IS_VENICE) {
+    return venicePayload(payload, {
+      effort: config.reasoningEffort,
+      excludeReasoning: config.reasoningExclude,
+      minCompletionTokens: config.minCompletionTokens,
+      retry,
+    });
+  }
   return config.aiProvider === 'deepseek' ? deepSeekPayload(payload) : payload;
 }
 
 function upstreamHeaders() {
   const headers = {
-    Authorization: `Bearer ${config.aiProvider === 'deepseek' ? config.deepSeekApiKey : config.openRouterApiKey}`,
+    Authorization: `Bearer ${UPSTREAM_KEY}`,
     'Content-Type': 'application/json',
   };
   if (config.aiProvider === 'openrouter' && config.openRouterReferer) headers['HTTP-Referer'] = config.openRouterReferer;
@@ -121,6 +132,7 @@ export async function callUpstream(payload, signal) {
     headers: upstreamHeaders(),
     body: JSON.stringify(payload),
     signal,
+    ...(IS_VENICE ? { redirect: 'error' } : {}),
   });
 }
 
@@ -130,10 +142,17 @@ export async function readUpstreamJson(response) {
   try {
     json = JSON.parse(text);
   } catch {
+    if (IS_VENICE) throw veniceError(null, { status: response.ok ? 502 : response.status });
     const err = new Error(`${UPSTREAM_NAME} returned non-JSON response (${response.status})`);
     err.status = response.status || 502;
     err.details = text.slice(0, 2000);
     throw err;
+  }
+  if (IS_VENICE && (!response.ok || json?.error)) {
+    throw veniceError(json, {
+      status: response.ok ? undefined : response.status,
+      retryAfter: response.headers?.get('retry-after'),
+    });
   }
   if (!response.ok) {
     const err = new Error(json?.error?.message || `${UPSTREAM_NAME} HTTP ${response.status}`);
@@ -184,6 +203,9 @@ function translatorPayload(text, originalModel, stream) {
     payload.reasoning_effort = config.translatorReasoningEffort;
     return deepSeekPayload(payload);
   }
+  if (IS_VENICE) {
+    return venicePayload(payload, { effort: config.translatorReasoningEffort, excludeReasoning: true });
+  }
 
   const providers = config.translatorProvider;
   // Do not inherit the roleplay model's global provider sort here:
@@ -209,6 +231,7 @@ export async function completeBuffered(input, signal, context = {}) {
   let json;
   let content = '';
   let reasoningChars = 0;
+  let toolCalls = false;
   let generationMs = 0;
 
   while (attempts <= config.emptyResponseRetry) {
@@ -237,7 +260,9 @@ export async function completeBuffered(input, signal, context = {}) {
 
     content = extractContent(json).trim();
     reasoningChars = reasoningSize(json);
-    if (content) break;
+    const calls = json?.choices?.[0]?.message?.tool_calls;
+    toolCalls = IS_VENICE && Array.isArray(calls) && calls.length > 0;
+    if (content || toolCalls) break;
 
     attempts += 1;
     const canRetry = attempts <= config.emptyResponseRetry;
@@ -268,7 +293,8 @@ export async function completeBuffered(input, signal, context = {}) {
   let translatorModel = null;
   const sourceLanguage = detectOutputLanguage(content);
   const mode = config.outputMode;
-  const shouldRewrite = mode === 'strict' || ((mode === 'auto' || mode === 'smart') && shouldRewriteToSpanish(content));
+  const shouldRewrite = !toolCalls &&
+    (mode === 'strict' || ((mode === 'auto' || mode === 'smart') && shouldRewriteToSpanish(content)));
 
   if (shouldRewrite) {
     context.stage = 'rewrite';
@@ -291,10 +317,16 @@ export async function completeBuffered(input, signal, context = {}) {
     rewritten = true;
   }
 
-  json.choices[0].message.content = content;
-  if (json.choices[0].message.reasoning != null && config.reasoningExclude) delete json.choices[0].message.reasoning;
-  if (json.choices[0].message.reasoning_content != null && config.reasoningExclude) delete json.choices[0].message.reasoning_content;
-  if (json.choices[0].message.reasoning_details != null && config.reasoningExclude) delete json.choices[0].message.reasoning_details;
+  const message = json.choices[0].message;
+  if (content || !toolCalls) message.content = content;
+  if (config.reasoningExclude) {
+    if (IS_VENICE) stripVeniceReasoning(message);
+    else {
+      if (message.reasoning != null) delete message.reasoning;
+      if (message.reasoning_content != null) delete message.reasoning_content;
+      if (message.reasoning_details != null) delete message.reasoning_details;
+    }
+  }
 
   return {
     json,
@@ -321,6 +353,11 @@ function startSseResponse(res) {
   res.setHeader('Connection', 'keep-alive');
   res.setHeader('X-Accel-Buffering', 'no');
   res.flushHeaders?.();
+}
+
+function endVeniceSse(res, signal) {
+  signal?.throwIfAborted();
+  if (!res.writableEnded) res.end('data: [DONE]\n\n');
 }
 
 export async function writeWithBackpressure(res, value, signal) {
@@ -434,11 +471,12 @@ export async function* iterateSseEvents(body) {
 
 export function parseSseEvent(rawEvent) {
   const lines = String(rawEvent || '').split(/\r?\n/);
+  const isErrorEvent = IS_VENICE && lines.some((line) => /^event:\s*error\s*$/.test(line));
   const dataLines = lines
     .filter((line) => line.startsWith('data:'))
     .map((line) => line.slice(5).replace(/^ /, ''));
 
-  if (!dataLines.length) return { kind: 'other', raw: rawEvent };
+  if (!dataLines.length) return { kind: isErrorEvent ? 'error' : 'other', raw: rawEvent };
 
   const data = dataLines.join('\n');
   if (data.trim() === '[DONE]') return { kind: 'done', raw: rawEvent };
@@ -447,8 +485,9 @@ export function parseSseEvent(rawEvent) {
   try {
     json = JSON.parse(data);
   } catch {
-    return { kind: 'other', raw: rawEvent };
+    return { kind: isErrorEvent ? 'error' : (IS_VENICE ? 'invalid' : 'other'), raw: rawEvent };
   }
+  if (IS_VENICE && (isErrorEvent || json?.error)) return { kind: 'error', json };
 
   const choice = json?.choices?.[0] || {};
   const delta = choice?.delta || {};
@@ -472,11 +511,33 @@ export function parseSseEvent(rawEvent) {
     json,
     content,
     reasoningChars,
+    toolCalls: Array.isArray(delta.tool_calls) && delta.tool_calls.length > 0,
     finishReason: choice.finish_reason || null,
   };
 }
 
+async function* iterateCompletionEvents(body) {
+  for await (const raw of iterateSseEvents(body)) {
+    const parsed = parseSseEvent(raw);
+    if (IS_VENICE) {
+      if (parsed.kind === 'error') throw veniceError(parsed.json, { stream: true });
+      if (parsed.kind === 'invalid') throw veniceError({ code: 'INVALID_SSE_EVENT' }, { stream: true });
+      if (parsed.kind === 'done') return;
+      if (config.reasoningExclude && Array.isArray(parsed.json?.choices)) {
+        let changed = false;
+        for (const choice of parsed.json.choices) {
+          if (stripVeniceReasoning(choice?.delta)) changed = true;
+        }
+        if (changed) parsed.raw = `data: ${JSON.stringify(parsed.json)}`;
+      }
+    }
+    yield parsed;
+  }
+  if (IS_VENICE) throw veniceError({ code: 'INCOMPLETE_STREAM' }, { stream: true });
+}
+
 export async function streamPassthrough(input, res, signal, context = {}) {
+  if (IS_VENICE) return streamInspected(input, res, signal, context, false);
   const payload = preparePayload(input, { stream: true });
   context.attempt = 1;
   context.attempts = 1;
@@ -552,10 +613,10 @@ async function streamRewriteToSpanish(text, originalModel, res, signal) {
   const base = completionBase(payload.model);
   let startedVisibleOutput = false;
   let translatedChars = 0;
+  let hasVisibleText = false;
   let finishReason = 'stop';
 
-  for await (const rawEvent of iterateSseEvents(response.body)) {
-    const parsed = parseSseEvent(rawEvent);
+  for await (const parsed of iterateCompletionEvents(response.body)) {
     if (parsed.kind !== 'chunk') continue;
 
     if (parsed.finishReason) finishReason = parsed.finishReason;
@@ -567,15 +628,17 @@ async function streamRewriteToSpanish(text, originalModel, res, signal) {
     }
 
     translatedChars += parsed.content.length;
+    if (parsed.content.trim()) hasVisibleText = true;
     await writeSyntheticChunk(res, base, { content: parsed.content }, null, signal);
   }
 
-  if (!startedVisibleOutput || translatedChars === 0) {
+  if (!startedVisibleOutput || (IS_VENICE && !hasVisibleText)) {
     throw new Error('Translator returned an empty streaming response');
   }
 
   await writeSyntheticChunk(res, base, {}, finishReason, signal);
-  await writeWithBackpressure(res, 'data: [DONE]\n\n', signal);
+  if (IS_VENICE) endVeniceSse(res, signal);
+  else await writeWithBackpressure(res, 'data: [DONE]\n\n', signal);
 
   return {
     rewrite_ms: Date.now() - rewriteStarted,
@@ -584,7 +647,11 @@ async function streamRewriteToSpanish(text, originalModel, res, signal) {
   };
 }
 
-export async function streamSmart(input, res, signal, context = {}) {
+export function streamSmart(input, res, signal, context = {}) {
+  return streamInspected(input, res, signal, context, true);
+}
+
+async function streamInspected(input, res, signal, context, detectLanguage) {
   const totalStarted = Date.now();
   let attempts = 0;
   let bufferingNoticeSent = false;
@@ -616,7 +683,7 @@ export async function streamSmart(input, res, signal, context = {}) {
 
     // Only commit HTTP 200/SSE to Janitor after the upstream accepted the request.
     startSseResponse(res);
-    if (!bufferingNoticeSent) {
+    if (detectLanguage && !bufferingNoticeSent) {
       await writeWithBackpressure(res, ': proxy-smart-buffering\n\n', signal);
       bufferingNoticeSent = true;
     }
@@ -624,6 +691,7 @@ export async function streamSmart(input, res, signal, context = {}) {
     let bufferedEvents = [];
     let content = '';
     let reasoningChars = 0;
+    let toolCalls = false;
     let decision = 'pending';
     let languageDetected = 'unknown';
     let decisionMs = 0;
@@ -631,18 +699,27 @@ export async function streamSmart(input, res, signal, context = {}) {
 
     context.stage = 'stream';
     try {
-      for await (const rawEvent of iterateSseEvents(response.body)) {
-        const parsed = parseSseEvent(rawEvent);
-
+      for await (const parsed of iterateCompletionEvents(response.body)) {
+        if (!detectLanguage && parsed.kind === 'other') {
+          await writeRawSseEvent(res, parsed.raw, signal);
+          continue;
+        }
         if (parsed.kind === 'chunk') {
           content += parsed.content || '';
           reasoningChars += parsed.reasoningChars || 0;
+          if (IS_VENICE && parsed.toolCalls) toolCalls = true;
         }
 
         if (decision === 'pending') {
-          bufferedEvents.push(rawEvent);
+          bufferedEvents.push(parsed.raw);
 
-          if (content.length >= config.smartDetectChars) {
+          if (toolCalls || (!detectLanguage && content.trim())) {
+            decision = 'pass';
+            decisionMs = Date.now() - generationStarted;
+            for (const event of bufferedEvents) await writeRawSseEvent(res, event, signal);
+            bufferedEvents = [];
+            passThroughStarted = true;
+          } else if (detectLanguage && !(IS_VENICE && payload.tools?.length) && content.length >= config.smartDetectChars) {
             languageDetected = detectOutputLanguage(content);
 
             if (languageDetected === 'en') {
@@ -666,7 +743,7 @@ export async function streamSmart(input, res, signal, context = {}) {
             }
           }
         } else if (decision === 'pass') {
-          await writeRawSseEvent(res, rawEvent, signal);
+          await writeRawSseEvent(res, parsed.raw, signal);
         }
         // decision === 'rewrite': continue consuming source silently.
       }
@@ -685,7 +762,7 @@ export async function streamSmart(input, res, signal, context = {}) {
     const generationMs = Date.now() - generationStarted;
     const trimmedContent = content.trim();
 
-    if (!trimmedContent) {
+    if (!trimmedContent && !toolCalls) {
       attempts += 1;
       const canRetry = attempts <= config.emptyResponseRetry;
       const emptyErr = new Error('Model returned no visible content');
@@ -726,8 +803,8 @@ export async function streamSmart(input, res, signal, context = {}) {
     }
 
     if (decision === 'pass') {
-      // Source stream normally carries its own [DONE]; close the HTTP response too.
-      if (!res.writableEnded) res.end();
+      if (IS_VENICE) endVeniceSse(res, signal);
+      else if (!res.writableEnded) res.end();
       return {
         elapsed_ms: Date.now() - totalStarted,
         generation_ms: generationMs,
@@ -736,7 +813,9 @@ export async function streamSmart(input, res, signal, context = {}) {
         attempts: attempts + 1,
         rewritten: false,
         language_detected: languageDetected,
-        stream_strategy: passThroughStarted ? 'smart_passthrough' : 'smart_buffered_passthrough',
+        stream_strategy: detectLanguage
+          ? (passThroughStarted ? 'smart_passthrough' : 'smart_buffered_passthrough')
+          : 'sse_passthrough',
         translator_model: null,
         visible_chars: trimmedContent.length,
         reasoning_chars: reasoningChars,
@@ -801,11 +880,26 @@ export async function sendBufferedAsSse(res, json, signal) {
 
   const base = { id, object: 'chat.completion.chunk', created, model };
   await writeWithBackpressure(res, `data: ${JSON.stringify({ ...base, choices: [{ index: 0, delta: { role: 'assistant' }, finish_reason: null }] })}\n\n`, signal);
+  if (IS_VENICE && !config.reasoningExclude) {
+    const reasoning = veniceReasoningDelta(message);
+    if (Object.keys(reasoning).length) await writeSyntheticChunk(res, base, reasoning, null, signal);
+  }
   for (const part of splitForSse(content)) {
     await writeWithBackpressure(res, `data: ${JSON.stringify({ ...base, choices: [{ index: 0, delta: { content: part }, finish_reason: null }] })}\n\n`, signal);
   }
+  if (IS_VENICE && Array.isArray(message.tool_calls) && message.tool_calls.length) {
+    const toolCalls = message.tool_calls.map((call, index) => ({ ...call, index }));
+    await writeSyntheticChunk(res, base, { tool_calls: toolCalls }, null, signal);
+  }
   const finishReason = json?.choices?.[0]?.finish_reason || 'stop';
   await writeWithBackpressure(res, `data: ${JSON.stringify({ ...base, choices: [{ index: 0, delta: {}, finish_reason: finishReason }] })}\n\n`, signal);
-  await writeWithBackpressure(res, 'data: [DONE]\n\n', signal);
-  if (!res.writableEnded) res.end();
+  if (IS_VENICE && json?.usage) {
+    await writeWithBackpressure(res, `data: ${JSON.stringify({ ...base, choices: [], usage: json.usage })}\n\n`, signal);
+  }
+  if (IS_VENICE) {
+    endVeniceSse(res, signal);
+  } else {
+    await writeWithBackpressure(res, 'data: [DONE]\n\n', signal);
+    if (!res.writableEnded) res.end();
+  }
 }

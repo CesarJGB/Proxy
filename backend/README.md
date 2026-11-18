@@ -1,6 +1,6 @@
-# Janitor → OpenRouter / DeepSeek Proxy
+# Proxy de Janitor para OpenRouter, DeepSeek y Venice
 
-Proxy OpenAI-compatible pensado para usar **Janitor AI con OpenRouter o DeepSeek directo** desde un VPS/Coolify.
+Proxy compatible con OpenAI para usar **Janitor AI con OpenRouter, DeepSeek directo o Venice AI** desde un VPS o Coolify.
 
 ## Qué resuelve
 
@@ -21,7 +21,7 @@ OpenRouter usa `POST https://openrouter.ai/api/v1/chat/completions`; el streamin
 
 OpenRouter sigue siendo el proveedor predeterminado si no defines `AI_PROVIDER`.
 
-OpenRouter:
+### OpenRouter
 
 ```env
 AI_PROVIDER=openrouter
@@ -31,7 +31,7 @@ FORCE_MODEL=deepseek/deepseek-v4-flash
 OUTPUT_MODE=smart
 ```
 
-DeepSeek directo (configuración sencilla y rápida recomendada):
+### DeepSeek directo
 
 ```env
 AI_PROVIDER=deepseek
@@ -40,11 +40,6 @@ PROXY_API_KEY=<tu-clave-actual-del-proxy>
 FORCE_MODEL=deepseek-flash
 OUTPUT_MODE=prompt
 ```
-
-En Coolify actualiza estas variables en **Environment Variables** y redespliega.
-Solo es obligatoria la API key del proveedor seleccionado, además de `PROXY_API_KEY`.
-Janitor conserva exactamente la misma URL y `PROXY_API_KEY`; `FORCE_MODEL` sustituye
-el modelo enviado por Janitor, por lo que tampoco necesitas cambiar su configuración.
 
 DeepSeek usa `https://api.deepseek.com/chat/completions`. El proxy envía solamente
 los campos admitidos por su [API oficial](https://api-docs.deepseek.com/api/create-chat-completion/),
@@ -60,20 +55,72 @@ razonamiento; `max_completion_tokens` se convierte a `max_tokens` cuando no exis
 este último. `MIN_COMPLETION_TOKENS` sigue aplicándose. Los objetos `reasoning`
 y `REASONING_MAX_TOKENS` de OpenRouter no se envían a DeepSeek.
 
-`OUTPUT_MODE=prompt` evita la traducción secundaria y conserva el streaming directo.
-También siguen disponibles `smart` (detección local mientras recibe SSE), `auto`
-y `strict`. Si estos modos necesitan traducir, usan el proveedor seleccionado:
-OpenRouter conserva `openai/gpt-oss-20b:nitro`; DeepSeek usa `deepseek-flash`, con
-`TRANSLATOR_REASONING_EFFORT=none` por defecto para traducir sin pensamiento.
-Puedes definir `TRANSLATOR_MODEL` con un modelo compatible con ese proveedor
-(por ejemplo `deepseek-flash` o `deepseek-v4-pro` para DeepSeek). Al cambiar de
-proveedor elimina o actualiza cualquier `TRANSLATOR_MODEL` explícito del anterior.
+### Venice AI
+
+```env
+AI_PROVIDER=venice
+VENICE_API_KEY=<tu-clave-de-venice>
+PROXY_API_KEY=<tu-clave-actual-del-proxy>
+FORCE_MODEL=deepseek-v4-1-flash-1017-uncensored
+OUTPUT_MODE=smart
+```
+
+Venice usa `https://api.venice.ai/api/v1/chat/completions`. El adaptador conserva
+los mensajes y su historial, aplica la política de español y filtra los campos
+de la solicitud. Envía `max_completion_tokens` como límite total, incluidos los
+tokens de razonamiento. Si solo llega `max_tokens` con un valor positivo, lo
+convierte. Si llegan ambos, prevalece `max_completion_tokens`.
+`MIN_COMPLETION_TOKENS` fija el piso de ese límite.
+
+El modelo recomendado admite `none`, `low`, `high` y `max` en
+`reasoning_effort`. `REASONING_EFFORT` tiene prioridad sobre el esfuerzo
+solicitado por el cliente. También se admite `reasoning.enabled` cuando no se
+envía un esfuerzo válido. Si un intento queda vacío y el cliente o el operador
+no eligieron un ajuste de razonamiento, el reintento del modelo recomendado usa
+`none`.
+
+En `venice_parameters` se aceptan los booleanos `disable_thinking`,
+`strip_thinking_response` e `include_venice_system_prompt`. El prompt propio de
+Venice queda desactivado por defecto para preservar las instrucciones de
+Janitor. El proxy descarta los ajustes de búsqueda, scraping, personajes y
+sufijos del modelo que activan funciones adicionales. `REASONING_EXCLUDE=true`
+oculta el razonamiento en las respuestas JSON y SSE.
+[Referencia de chat](https://docs.venice.ai/api-reference/endpoint/chat/completions) ·
+[Capacidades del modelo](https://docs.venice.ai/models/deepseek-v4-1-flash-1017-uncensored)
+
+Los streams directos conservan el evento de uso con `choices: []`. Si Venice
+envía un error dentro del stream, el proxy lo devuelve como un evento SSE
+sanitizado y cierra con un solo `[DONE]`. Las salidas sin texto visible ni
+llamadas a funciones usan el reintento configurado. Los errores de autenticación,
+saldo, validación, límites de uso y sobrecarga conservan su estado HTTP cuando
+ocurren antes de que empiece el SSE.
+[Errores de Venice](https://docs.venice.ai/api-reference/error-codes) ·
+[Formato SSE](https://docs.venice.ai/guides/getting-started/openai-migration#streaming-format)
+
+### Modelo de traducción
+
+Cada proveedor usa su propio modelo predeterminado para traducir. Puedes
+sustituirlo mediante `TRANSLATOR_MODEL` con un ID válido para el proveedor
+seleccionado.
+
+| Proveedor | Modelo predeterminado | `TRANSLATOR_REASONING_EFFORT` predeterminado |
+| --- | --- | --- |
+| OpenRouter | `openai/gpt-oss-20b:nitro` | `low` |
+| DeepSeek directo | `deepseek-flash` | `none` |
+| Venice | `qwen3-5-35b-a3b` | `none` |
 
 ## Modos de idioma
 
 ### `OUTPUT_MODE=prompt`
 
-Una sola llamada. Conserva el streaming real del proveedor y es la opción más rápida/barata. El proxy inserta la política de español dentro del primer mensaje `system` y la refuerza al final de ese mismo bloque.
+Normalmente hace una sola llamada. Conserva el streaming real del proveedor y es la opción más rápida. El proxy inserta la política de español dentro del primer mensaje `system` y la refuerza al final de ese mismo bloque. Con Venice empieza a reenviar los fragmentos de respuesta cuando llega texto visible o una llamada a función, y puede reintentar si el stream termina vacío.
+
+### `OUTPUT_MODE=smart` (predeterminado)
+
+Cuando Janitor solicita streaming, el proxy guarda temporalmente los primeros
+fragmentos para detectar su idioma. Si la salida está en español, continúa el
+streaming original. Si detecta inglés, traduce la respuesta completa por SSE
+con el proveedor seleccionado.
 
 ### `OUTPUT_MODE=auto` — recomendado para empezar
 
@@ -87,30 +134,26 @@ Si Janitor solicita streaming, el proxy conserva el **protocolo SSE**, pero los 
 
 ### `OUTPUT_MODE=strict`
 
-Siempre hace una segunda llamada para renderizar la respuesta al español. Es el modo más insistente, pero también el más lento y consume más tokens.
+Hace una segunda llamada para renderizar el texto de roleplay al español. Conserva las respuestas de Venice con llamadas a funciones tal como llegaron. La segunda llamada añade latencia y consumo de tokens.
 
 ## Despliegue en Coolify
 
-1. Sube esta carpeta a un repositorio de GitHub.
-2. En Coolify crea un nuevo recurso desde ese repositorio.
-3. Selecciona despliegue mediante `Dockerfile`.
-4. Agrega las variables de `.env.example` en **Environment Variables**.
-5. Como mínimo configura:
+1. En Coolify crea una aplicación desde el repositorio y elige el build pack
+   **Dockerfile**. Para este repositorio usa `/backend` como **Base Directory**
+   y `/Dockerfile` como **Dockerfile Location**.
+2. En **Environment Variables** configura `AI_PROVIDER`, la API key del
+   proveedor y `PROXY_API_KEY` como variables de ejecución. Para Venice, usa
+   los valores del bloque anterior y guarda `VENICE_API_KEY` como secreto.
+3. Configura el puerto interno `3000`, asigna un dominio HTTPS y usa `/health`
+   para el health check.
 
-```env
-OPENROUTER_API_KEY=sk-or-v1-...
-PROXY_API_KEY=una-clave-larga-y-aleatoria
-OUTPUT_MODE=auto
-CORS_ORIGIN=*
-```
-
-6. Asigna un dominio HTTPS, por ejemplo:
-
-```text
-https://janitor-proxy.tudominio.com
-```
-
-7. En Coolify puedes usar `/health` como health check.
+Para cambiar de proveedor en una aplicación existente, actualiza `AI_PROVIDER`,
+agrega la API key correspondiente y fija `FORCE_MODEL` con un ID válido del
+nuevo proveedor. Si habías definido `TRANSLATOR_MODEL`, `TRANSLATOR_REASONING_EFFORT`
+o `REASONING_EFFORT`, revisa sus valores para el nuevo modelo o bórralos para
+usar los predeterminados. Redespliega con el mismo dominio y `PROXY_API_KEY`.
+Así Janitor conserva la URL, la clave y el campo de modelo que ya tenía.
+[Despliegue con Dockerfile en Coolify](https://coolify.io/docs/applications/builds/dockerfile)
 
 ## Configuración de Janitor
 
@@ -229,7 +272,7 @@ curl -N https://TU-DOMINIO/v1/chat/completions \
   -H "Authorization: Bearer TU_PROXY_API_KEY" \
   -H "Content-Type: application/json" \
   -d '{
-    "model": "TU_MODELO_OPENROUTER",
+    "model": "TU_MODELO_DEL_PROVEEDOR",
     "stream": true,
     "messages": [
       {"role":"user","content":"Salúdame y describe brevemente una noche lluviosa."}
@@ -242,6 +285,7 @@ curl -N https://TU-DOMINIO/v1/chat/completions \
 ```bash
 cp .env.example .env
 npm test
+npm run check
 npm run start:env
 ```
 
