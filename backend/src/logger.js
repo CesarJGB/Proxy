@@ -1,6 +1,11 @@
 import { config } from './config.js';
 
 const listeners = new Set();
+const defaultProvider = config.aiProvider === 'openrouter' ? config.providers.join(',') || 'auto' : config.aiProvider;
+
+function logModel(model) {
+  return sanitizeValue(config.forceModel || (typeof model === 'string' ? model : null));
+}
 
 export function onLog(fn) {
   listeners.add(fn);
@@ -39,6 +44,7 @@ const SAFE_DETAIL_KEYS = new Set([
   'retry',
   'retries',
   'retryable',
+  'retry_after',
   'retrying',
   'reasoning_chars',
   'message',
@@ -57,11 +63,7 @@ export function sanitizeErrorDetails(details, depth = 0, seen = new WeakSet()) {
   if (depth > 6) return '[truncated_depth]';
 
   if (typeof details === 'string') {
-    let clean = details.replace(SENSITIVE_VALUE_REGEX, '$1[REDACTED]');
-    if (clean.length > 1000) {
-      clean = `${clean.slice(0, 1000)}... [truncated ${clean.length - 1000} chars]`;
-    }
-    return clean;
+    return sanitizeValue(details, depth, seen);
   }
 
   if (typeof details === 'number' || typeof details === 'boolean') {
@@ -118,7 +120,8 @@ export function sanitizeValue(value, depth = 0, seen = new WeakSet()) {
   if (depth > 6) return '[truncated_depth]';
 
   if (typeof value === 'string') {
-    let clean = value.replace(SENSITIVE_VALUE_REGEX, '$1[REDACTED]');
+    let clean = config.veniceApiKey ? value.replaceAll(config.veniceApiKey, '[REDACTED]') : value;
+    clean = clean.replace(SENSITIVE_VALUE_REGEX, '$1[REDACTED]');
     if (clean.length > 1000) {
       clean = `${clean.slice(0, 1000)}... [truncated ${clean.length - 1000} chars]`;
     }
@@ -192,6 +195,16 @@ export function classifyError(error, {
       errorCode: 'proxy_aborted',
       upstreamStatus: null,
       errorMessage: 'Proxy server aborted request',
+      clientDisconnected: false,
+    };
+  }
+
+  if (error?.type === 'upstream_stream_error' || error?.type === 'upstream_http_error') {
+    return {
+      errorType: error.type,
+      errorCode: error.details?.code || `HTTP_${error.status}`,
+      upstreamStatus: error.status,
+      errorMessage: error.message,
       clientDisconnected: false,
     };
   }
@@ -344,8 +357,8 @@ export function logRequestStarted({
     request_id: requestId,
     route,
     stream: Boolean(stream),
-    model: config.forceModel || model || null,
-    provider: provider || config.providers.join(',') || 'auto',
+    model: logModel(model),
+    provider: provider || defaultProvider,
     output_mode: outputMode,
     messages: Number.isFinite(messages) ? messages : 0,
     elapsed_ms: 0,
@@ -389,8 +402,8 @@ export function logAttemptFailed({
     request_id: requestId,
     route,
     stream: Boolean(stream),
-    model: config.forceModel || model || null,
-    provider: provider || config.providers.join(',') || 'auto',
+    model: logModel(model),
+    provider: provider || defaultProvider,
     output_mode: outputMode,
     attempt,
     attempts,
@@ -436,8 +449,8 @@ export function logRequestCompleted({
     request_id: requestId,
     route,
     stream: Boolean(stream),
-    model: config.forceModel || model || null,
-    provider: provider || config.providers.join(',') || 'auto',
+    model: logModel(model),
+    provider: provider || defaultProvider,
     output_mode: outputMode,
     elapsed_ms: elapsedMs,
     generation_ms: generationMs,
@@ -448,7 +461,7 @@ export function logRequestCompleted({
     rewritten: Boolean(rewritten),
     language_detected: languageDetected,
     stream_strategy: streamStrategy,
-    translator_model: translatorModel,
+    translator_model: sanitizeValue(translatorModel),
     visible_chars: visibleChars,
     ...(sourceChars !== undefined ? { source_chars: sourceChars } : {}),
     reasoning_chars: reasoningChars,
@@ -498,8 +511,8 @@ export function logRequestFailed({
     request_id: requestId,
     route,
     stream: Boolean(stream),
-    model: config.forceModel || model || null,
-    provider: provider || config.providers.join(',') || 'auto',
+    model: logModel(model),
+    provider: provider || defaultProvider,
     output_mode: outputMode,
     attempt: attempt != null ? attempt : (attempts > 0 ? attempts : null),
     attempts,
